@@ -1,0 +1,31 @@
+[project]
+name = "ralph-tui"
+version = "0.1.0"
+description = "Meta-orchestrator TUI for repeated Claude Code sessions with AI-powered output analysis"
+requires-python = ">=3.11"
+dependencies = [
+    "textual>=3.0",
+    "pyyaml>=6.0",
+    "httpx>=0.27",
+    "claude-agent-sdk",
+]
+
+[project.scripts]
+ralph = "ralph_tui.app:main"
+
+[tool.setuptools.packages.find]
+include = ["ralph_tui*"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "freezegun>=1.4",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
