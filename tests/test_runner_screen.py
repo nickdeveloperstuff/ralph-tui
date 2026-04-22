@@ -717,6 +717,28 @@ class TestStickyScroll:
             assert log.auto_scroll is False
 
     @pytest.mark.asyncio
+    async def test_empty_log_keeps_auto_scroll_true(self, tmp_path):
+        """When content fits in the viewport (max_scroll_y==0), auto_scroll stays True."""
+        from ralph_tui.app import RalphApp
+        from ralph_tui.screens.runner_screen import StickyRichLog
+        screen = self._make_screen(tmp_path)
+        app = RalphApp()
+        async with app.run_test(size=(80, 40)) as pilot:  # tall terminal, little content
+            await app.push_screen(screen)
+            await pilot.pause()
+            log = screen.query_one("#output-log", StickyRichLog)
+            # No writes — buffer fits trivially.
+            assert log.max_scroll_y == 0
+            assert log.auto_scroll is True
+
+            # A few short writes, still within viewport.
+            for i in range(3):
+                log.write(f"row {i}", expand=True)
+            await pilot.pause()
+            assert log.max_scroll_y == 0
+            assert log.auto_scroll is True
+
+    @pytest.mark.asyncio
     async def test_bottom_threshold_boundary_is_exactly_one_line(self, tmp_path):
         """BOTTOM_THRESHOLD=1: scroll_y == max_scroll_y-1 is still 'at tail',
         scroll_y == max_scroll_y-2 flips auto_scroll off."""
