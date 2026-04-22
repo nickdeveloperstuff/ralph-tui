@@ -25,6 +25,23 @@ from ralph_tui.config import RalphConfig
 from ralph_tui.orchestrator import Orchestrator, IterationResult, OrchestratorState, ActivityEvent, UsageInfo
 
 
+class StickyRichLog(RichLog):
+    """RichLog that pauses auto-scroll while the user is scrolled up.
+
+    Claude-Code-style behavior: while at (or within one line of) the tail,
+    new writes scroll to the bottom. Scrolling up disables auto-scroll so
+    the view stays put. Pressing End re-engages follow.
+    """
+
+    BOTTOM_THRESHOLD = 1
+
+    def watch_scroll_y(self, old: float, new: float) -> None:
+        if self.max_scroll_y == 0:
+            self.auto_scroll = True
+            return
+        self.auto_scroll = (self.max_scroll_y - new) <= self.BOTTOM_THRESHOLD
+
+
 class StatusUpdate(Message):
     def __init__(self, status: str) -> None:
         super().__init__()
@@ -97,6 +114,7 @@ class RunnerScreen(Screen):
 
     BINDINGS = [
         ("escape", "go_back", "Back"),
+        ("end", "follow_tail", "Follow tail"),
     ]
 
     def __init__(self, config: RalphConfig) -> None:
@@ -118,7 +136,7 @@ class RunnerScreen(Screen):
             "Iteration: 0/0  Status: Initializing  Cost: $0.0000  Elapsed: 0s",
             id="status-bar",
         )
-        yield RichLog(highlight=True, wrap=True, id="output-log")
+        yield StickyRichLog(highlight=True, wrap=True, id="output-log")
         yield Label("Analysis History:", id="analysis-header")
         yield ListView(id="analysis-list")
         with Vertical(id="footer-bar"):
@@ -292,3 +310,8 @@ class RunnerScreen(Screen):
         if self.orchestrator:
             self.orchestrator.stop()
         self.app.pop_screen()
+
+    def action_follow_tail(self) -> None:
+        log = self.query_one("#output-log", StickyRichLog)
+        log.auto_scroll = True
+        log.scroll_end(animate=False)

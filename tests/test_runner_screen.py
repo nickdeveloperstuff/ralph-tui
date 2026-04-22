@@ -462,3 +462,95 @@ class TestRichLogHorizontalFill:
                 f"first line wrapped at {first_len} cells "
                 f"(expected > 100 — near terminal width)"
             )
+
+
+class TestStickyScroll:
+    """Task 3: the output log should pause auto-scroll when the user scrolls up."""
+
+    @staticmethod
+    def _make_screen(tmp_path):
+        from ralph_tui.config import RalphConfig
+        from ralph_tui.screens.runner_screen import RunnerScreen
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        (proj / "x.txt").write_text("x")
+        cfg = RalphConfig(
+            project_path=str(proj),
+            initial_prompt="x",
+            rerun_prompt="y",
+            min_iterations=1,
+            max_iterations=1,
+        )
+        screen = RunnerScreen(cfg)
+        screen._run_orchestrator = lambda: None
+        return screen
+
+    @pytest.mark.asyncio
+    async def test_sticky_log_keeps_position_when_scrolled_up(self, tmp_path):
+        """Writes arriving while the user is scrolled up must not yank the view."""
+        from ralph_tui.app import RalphApp
+        from ralph_tui.screens.runner_screen import StickyRichLog, TextChunk
+        screen = self._make_screen(tmp_path)
+        app = RalphApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await app.push_screen(screen)
+            await pilot.pause()
+            log = screen.query_one("#output-log", StickyRichLog)
+            for i in range(200):
+                log.write(f"line {i}", expand=True)
+            await pilot.pause()
+            # Scroll to the top-ish.
+            log.scroll_to(y=0, animate=False)
+            await pilot.pause()
+            saved_y = log.scroll_y
+            # More writes arriving while the user sits in history.
+            for i in range(200, 250):
+                log.write(f"line {i}", expand=True)
+            await pilot.pause()
+            assert log.scroll_y == saved_y, (
+                f"view jumped: was {saved_y}, now {log.scroll_y}"
+            )
+            assert log.auto_scroll is False
+
+    @pytest.mark.asyncio
+    async def test_sticky_log_resumes_autoscroll_at_bottom(self, tmp_path):
+        """End binding jumps to tail and re-engages auto_scroll."""
+        from ralph_tui.app import RalphApp
+        from ralph_tui.screens.runner_screen import StickyRichLog
+        screen = self._make_screen(tmp_path)
+        app = RalphApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await app.push_screen(screen)
+            await pilot.pause()
+            log = screen.query_one("#output-log", StickyRichLog)
+            for i in range(200):
+                log.write(f"line {i}", expand=True)
+            await pilot.pause()
+            log.scroll_to(y=0, animate=False)
+            await pilot.pause()
+            assert log.auto_scroll is False
+            screen.action_follow_tail()
+            await pilot.pause()
+            assert log.auto_scroll is True
+            assert log.scroll_y >= log.max_scroll_y - 1
+
+    @pytest.mark.asyncio
+    async def test_end_binding_jumps_to_bottom(self, tmp_path):
+        """End binding alone must be enough to snap to the tail."""
+        from ralph_tui.app import RalphApp
+        from ralph_tui.screens.runner_screen import StickyRichLog
+        screen = self._make_screen(tmp_path)
+        app = RalphApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await app.push_screen(screen)
+            await pilot.pause()
+            log = screen.query_one("#output-log", StickyRichLog)
+            for i in range(100):
+                log.write(f"row {i}", expand=True)
+            await pilot.pause()
+            log.scroll_to(y=0, animate=False)
+            await pilot.pause()
+            await pilot.press("end")
+            await pilot.pause()
+            assert log.scroll_y >= log.max_scroll_y - 1
+            assert log.auto_scroll is True
