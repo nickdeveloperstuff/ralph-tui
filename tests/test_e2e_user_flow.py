@@ -196,6 +196,104 @@ class TestE2ETask1PlanUsageResume:
                 assert call_count[0] >= 2
 
 
+class TestE2ETask1StopDuringPlanUsageWait:
+    """From the user's POV: pressing Stop during the plan-usage countdown halts the run.
+
+    The 5-retry api_rate_limit cap never applies; only the plan-usage wait can run for
+    hours. A user must be able to cancel that wait — asserting both that no resume
+    query() fires and that the RunnerScreen returns to its 'Back' terminal state.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stop_button_during_plan_usage_countdown(self, tmp_path, monkeypatch):
+        import ralph_tui.rate_limit as rl
+        import ralph_tui.orchestrator as orch_mod
+        # Tight tick so _sleep_until_resume polls its stop_event aggressively.
+        monkeypatch.setattr(rl, "BUFFER_MINUTES", 0)
+        monkeypatch.setattr(orch_mod, "PLAN_USAGE_TICK_SEC", 0.1)
+
+        call_count = [0]
+
+        async def mock_query(prompt, options):
+            call_count[0] += 1
+            # Reset clock 2 minutes in the future so wait is long enough
+            # for Stop to fire mid-countdown.
+            reset = (datetime.now() + timedelta(minutes=2)).strftime("%-I:%M%p").lower()
+            from claude_agent_sdk import AssistantMessage, TextBlock
+            a = MagicMock(spec=AssistantMessage)
+            a.error = "rate_limit"
+            b = MagicMock(spec=TextBlock)
+            b.text = f"You've hit your session limit · resets {reset}"
+            a.content = [b]
+            yield a
+            r = MagicMock(spec=ResultMessage)
+            r.is_error = True
+            r.session_id = "sess-pu-stop"
+            r.result = ""
+            r.total_cost_usd = 0.0
+            r.duration_ms = 0
+            r.num_turns = 0
+            yield r
+
+        monkeypatch.setattr(orch_mod, "query", mock_query)
+
+        proj_path = str(_make_proj(tmp_path))
+        fake_analysis = MagicMock(should_stop=True, reason="done", summary="done")
+        with patch("ralph_tui.orchestrator.analyze_output",
+                   new_callable=AsyncMock, return_value=fake_analysis):
+            from ralph_tui.app import RalphApp
+            app = RalphApp(launch_cwd=proj_path)
+            async with app.run_test(size=(200, 50)) as pilot:
+                await _fill_config_and_start(pilot, proj_path)
+
+                from ralph_tui.screens.runner_screen import StickyRichLog
+                log = app.screen.query_one("#output-log", StickyRichLog)
+
+                # Wait until the plan-usage wait has begun.
+                for _ in range(200):
+                    text = "\n".join(str(s.text) if hasattr(s, "text") else ""
+                                     for s in log.lines)
+                    if "Plan usage limit hit" in text:
+                        break
+                    await pilot.pause()
+                    await asyncio.sleep(0.05)
+                else:
+                    pytest.fail("plan-usage wait never started")
+
+                _save_svg(app, "task1_stop_during_wait_before")
+
+                # User clicks Stop mid-countdown.
+                await pilot.click("#btn-stop")
+
+                # Wait until RunComplete flipped the button label to "Back",
+                # signalling the orchestrator returned and no second query fired.
+                from textual.widgets import Button
+                btn = app.screen.query_one("#btn-stop", Button)
+                for _ in range(200):
+                    if str(btn.label) == "Back":
+                        break
+                    await pilot.pause()
+                    await asyncio.sleep(0.05)
+                else:
+                    pytest.fail(
+                        f"RunComplete never fired after Stop; button label still {btn.label!r}"
+                    )
+
+                _save_svg(app, "task1_stop_during_wait_after")
+
+                # No resume query: only the single plan-usage hit.
+                assert call_count[0] == 1, (
+                    f"resume query fired after Stop: call_count={call_count[0]}"
+                )
+                # 'Stopped by user' must be somewhere in the run log.
+                full = "\n".join(str(s.text) if hasattr(s, "text") else ""
+                                 for s in log.lines)
+                assert "Stopped by user" in full or "Status: Stopped" in full, (
+                    f"no stop indicator in log; tail: "
+                    f"{[str(s.text) for s in log.lines[-6:] if hasattr(s, 'text')]}"
+                )
+
+
 # =============================================================================
 # Task 2 — horizontal fill
 # =============================================================================
