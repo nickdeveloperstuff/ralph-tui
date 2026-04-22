@@ -685,6 +685,44 @@ class TestStickyScroll:
             assert log.scroll_y >= log.max_scroll_y - 1
             assert log.auto_scroll is True
 
+    @pytest.mark.asyncio
+    async def test_bottom_threshold_boundary_is_exactly_one_line(self, tmp_path):
+        """BOTTOM_THRESHOLD=1: scroll_y == max_scroll_y-1 is still 'at tail',
+        scroll_y == max_scroll_y-2 flips auto_scroll off."""
+        from ralph_tui.app import RalphApp
+        from ralph_tui.screens.runner_screen import StickyRichLog
+        screen = self._make_screen(tmp_path)
+        app = RalphApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await app.push_screen(screen)
+            await pilot.pause()
+            log = screen.query_one("#output-log", StickyRichLog)
+            assert log.BOTTOM_THRESHOLD == 1  # assumption the test rests on
+            for i in range(200):
+                log.write(f"line {i}", expand=True)
+            await pilot.pause()
+            assert log.max_scroll_y >= 3, (
+                f"need >= 3 scroll rows for the test; got {log.max_scroll_y}"
+            )
+
+            # exactly one line above the tail → still 'at tail'
+            log.scroll_to(y=log.max_scroll_y - 1, animate=False)
+            await pilot.pause()
+            await pilot.pause()
+            assert log.auto_scroll is True, (
+                f"scroll_y=max-1 should keep auto_scroll True "
+                f"(scroll_y={log.scroll_y}, max={log.max_scroll_y})"
+            )
+
+            # two lines above the tail → scrolled up
+            log.scroll_to(y=log.max_scroll_y - 2, animate=False)
+            await pilot.pause()
+            await pilot.pause()
+            assert log.auto_scroll is False, (
+                f"scroll_y=max-2 should flip auto_scroll False "
+                f"(scroll_y={log.scroll_y}, max={log.max_scroll_y})"
+            )
+
 
 class TestActivityTimerDuringTool:
     """Task 4: in-flight tool execution must count as activity."""
