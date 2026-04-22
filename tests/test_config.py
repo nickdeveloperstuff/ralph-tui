@@ -161,6 +161,38 @@ class TestRetryLimitConfig:
         assert loaded.max_rate_limit_retries == 15
 
 
+class TestPlanUsageWaitConfig:
+    """Validation bounds for max_plan_usage_wait_seconds (60s..86400s)."""
+
+    def test_default_is_six_hours(self, tmp_path):
+        cfg = _valid_config(tmp_path)
+        assert cfg.max_plan_usage_wait_seconds == 21600
+
+    def test_rejects_zero(self, tmp_path):
+        cfg = _valid_config(tmp_path, max_plan_usage_wait_seconds=0)
+        errors = cfg.validate()
+        assert any("max_plan_usage_wait_seconds" in e for e in errors)
+
+    def test_rejects_above_24h(self, tmp_path):
+        cfg = _valid_config(tmp_path, max_plan_usage_wait_seconds=86401)
+        errors = cfg.validate()
+        assert any("max_plan_usage_wait_seconds" in e for e in errors)
+
+    def test_accepts_one_hour(self, tmp_path):
+        cfg = _valid_config(tmp_path, max_plan_usage_wait_seconds=3600)
+        errors = cfg.validate()
+        assert not any("max_plan_usage_wait_seconds" in e for e in errors)
+
+    def test_accepts_boundary_values(self, tmp_path):
+        """60s and 86400s are the inclusive boundary values."""
+        for v in (60, 86400):
+            cfg = _valid_config(tmp_path, max_plan_usage_wait_seconds=v)
+            errors = cfg.validate()
+            assert not any("max_plan_usage_wait_seconds" in e for e in errors), (
+                f"boundary value {v} rejected: {errors}"
+            )
+
+
 class TestVerificationConfig:
     """Tests for blind verification system config fields."""
 
