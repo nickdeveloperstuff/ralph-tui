@@ -584,3 +584,220 @@ class TestE2ETask4ActivityTimerDuringTool:
                 # orchestrator completion). The key assertion is that WITHOUT the
                 # fix it would have fired DURING the tool, which we've just proven
                 # above.
+
+
+# =============================================================================
+# Cross-cutting — all four goals in one real run
+# =============================================================================
+
+_LONG_PARAGRAPH = (
+    "The quick brown fox jumps over the lazy dog. " * 10
+)
+
+
+class TestE2ECrossCuttingAllFourGoals:
+    """One monster test that threads every goal through a single RalphApp run.
+
+    Sequence: Config → Start → plan_usage error → resume → wide stream →
+    tool_start Bash → tool_end → more wide stream → scroll up → End →
+    completion. Saves four snapshots — one per goal.
+    """
+
+    @pytest.mark.asyncio
+    async def test_full_session_all_four_goals(self, tmp_path, monkeypatch):
+        import ralph_tui.rate_limit as rl
+        import ralph_tui.orchestrator as orch_mod
+        monkeypatch.setattr(rl, "BUFFER_MINUTES", 0)
+        monkeypatch.setattr(orch_mod, "PLAN_USAGE_TICK_SEC", 0.1)
+        # Neutralize the stream watchdog — the orchestrated tool gap is intentional.
+        monkeypatch.setattr(orch_mod, "SOFT_TIMEOUT_SEC", 600)
+        monkeypatch.setattr(orch_mod, "HARD_TIMEOUT_SEC", 1200)
+
+        call_count = [0]
+
+        async def cross_cutting_query(prompt, options):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # Goal 1 — plan_usage error.
+                reset = (datetime.now() + timedelta(seconds=30)).strftime("%-I:%M%p").lower()
+                from claude_agent_sdk import AssistantMessage, TextBlock
+                a = MagicMock(spec=AssistantMessage)
+                a.error = "rate_limit"
+                b = MagicMock(spec=TextBlock)
+                b.text = f"You've hit your session limit · resets {reset}"
+                a.content = [b]
+                yield a
+                r = MagicMock(spec=ResultMessage)
+                r.is_error = True
+                r.session_id = "sess-cc"
+                r.result = ""
+                r.total_cost_usd = 0.0
+                r.duration_ms = 0
+                r.num_turns = 0
+                yield r
+                return
+
+            # Resume call: wide stream + tool_start/tool_end + more wide stream.
+            # Goal 2 — wide streamed text.
+            for i in range(8):
+                yield StreamEvent(
+                    uuid=f"pre-{i}",
+                    session_id="sess-cc",
+                    event={"type": "content_block_delta",
+                           "delta": {"type": "text_delta",
+                                     "text": f"pre-{i} " + _LONG_PARAGRAPH + "\n"}},
+                )
+
+            # Goal 4 — tool_start, then a beat, then tool_end.
+            yield StreamEvent(
+                uuid="ts",
+                session_id="sess-cc",
+                event={
+                    "type": "content_block_start",
+                    "content_block": {"type": "tool_use", "name": "Bash", "id": "tu-1"},
+                },
+            )
+            await asyncio.sleep(0.4)  # brief tool-in-flight window
+            yield StreamEvent(
+                uuid="te",
+                session_id="sess-cc",
+                event={"type": "content_block_stop"},
+            )
+
+            # Goal 3 — more streamed lines so the buffer is scrollable.
+            # Slow pace so scroll_to() has time to settle between writes.
+            for i in range(40):
+                yield StreamEvent(
+                    uuid=f"post-{i}",
+                    session_id="sess-cc",
+                    event={"type": "content_block_delta",
+                           "delta": {"type": "text_delta",
+                                     "text": f"post-line-{i:03d} " + _LONG_PARAGRAPH + "\n"}},
+                )
+                await asyncio.sleep(0.08)
+
+            r = MagicMock(spec=ResultMessage)
+            r.is_error = False
+            r.session_id = "sess-cc"
+            r.result = "all-done"
+            r.total_cost_usd = 0.05
+            r.duration_ms = 500
+            r.num_turns = 1
+            yield r
+
+        monkeypatch.setattr(orch_mod, "query", cross_cutting_query)
+
+        # Skip the real plan-usage sleep window.
+        from ralph_tui.orchestrator import Orchestrator as _Orch
+
+        async def fast_sleep(self, retry_at, wait_seconds, is_plan):
+            label = "Plan usage limit" if is_plan else "Rate limited"
+            await self._notify_status(
+                f"{label} — resuming at {retry_at.strftime('%H:%M')} (0s left)"
+            )
+            return True
+
+        monkeypatch.setattr(_Orch, "_sleep_until_resume", fast_sleep)
+
+        proj_path = str(_make_proj(tmp_path))
+        fake_analysis = MagicMock(should_stop=True, reason="done", summary="done")
+        with patch("ralph_tui.orchestrator.analyze_output",
+                   new_callable=AsyncMock, return_value=fake_analysis):
+            from ralph_tui.app import RalphApp
+            app = RalphApp(launch_cwd=proj_path)
+            async with app.run_test(size=(220, 50)) as pilot:
+                # Goal 1: countdown visible.
+                await _fill_config_and_start(pilot, proj_path)
+                from ralph_tui.screens.runner_screen import StickyRichLog
+                log = app.screen.query_one("#output-log", StickyRichLog)
+
+                for _ in range(200):
+                    text = "\n".join(str(s.text) if hasattr(s, "text") else ""
+                                     for s in log.lines)
+                    if "Plan usage limit hit" in text:
+                        break
+                    await pilot.pause()
+                    await asyncio.sleep(0.05)
+                else:
+                    pytest.fail("plan_usage wait never started")
+                _save_svg(app, "cross_cutting_goal1_plan_usage")
+
+                # Goal 2: wide streamed line arrives after resume.
+                for _ in range(400):
+                    if any(s.cell_length > 180 for s in log.lines):
+                        break
+                    await pilot.pause()
+                    await asyncio.sleep(0.03)
+                widest = max((s.cell_length for s in log.lines), default=0)
+                assert widest > 180, (
+                    f"wide streamed line never rendered; widest={widest}, "
+                    f"widget={log.size.width}"
+                )
+                _save_svg(app, "cross_cutting_goal2_wide_stream")
+
+                # Goal 4: _current_tool tracked through tool_start → tool_end.
+                screen = app.screen
+                for _ in range(400):
+                    if screen._current_tool == "Bash":
+                        break
+                    await pilot.pause()
+                    await asyncio.sleep(0.02)
+                # We don't require catching the in-flight window (it's 0.4s);
+                # pass if either we observed Bash or it already cleared.
+                for _ in range(400):
+                    if screen._current_tool is None:
+                        break
+                    await pilot.pause()
+                    await asyncio.sleep(0.02)
+                assert screen._current_tool is None, "tool_end never cleared current_tool"
+                _save_svg(app, "cross_cutting_goal4_after_tool")
+
+                # Goal 3: enough buffer to scroll, scroll to top, assert paused.
+                for _ in range(500):
+                    if log.max_scroll_y > 15 and len(log.lines) >= 50:
+                        break
+                    await pilot.pause()
+                    await asyncio.sleep(0.02)
+                assert log.max_scroll_y > 15, (
+                    f"never enough content to scroll (max_scroll_y={log.max_scroll_y})"
+                )
+                log.scroll_to(y=0, animate=False)
+                # Give watch_scroll_y a beat before the next stream write lands.
+                for _ in range(10):
+                    await pilot.pause()
+                    await asyncio.sleep(0.02)
+                    if log.auto_scroll is False:
+                        break
+                assert log.auto_scroll is False, (
+                    f"scroll_to(0) failed to pause auto_scroll; "
+                    f"scroll_y={log.scroll_y}, max={log.max_scroll_y}"
+                )
+                saved_y = log.scroll_y
+                saved_lines = len(log.lines)
+                for _ in range(200):
+                    if len(log.lines) > saved_lines + 5:
+                        break
+                    await pilot.pause()
+                    await asyncio.sleep(0.02)
+                assert log.scroll_y == saved_y, (
+                    f"sticky scroll broken mid-run: {saved_y} -> {log.scroll_y}"
+                )
+                _save_svg(app, "cross_cutting_goal3_scrolled_up")
+
+                # End returns to tail.
+                screen.action_follow_tail()
+                await pilot.pause()
+                await pilot.pause()
+                assert log.auto_scroll is True
+
+                # Let the run finish so call_count == 2 is real.
+                from textual.widgets import Button
+                btn = app.screen.query_one("#btn-stop", Button)
+                for _ in range(600):
+                    if str(btn.label) == "Back":
+                        break
+                    await pilot.pause()
+                    await asyncio.sleep(0.03)
+                assert call_count[0] == 2, (
+                    f"expected exactly 2 queries (plan_usage + resume); got {call_count[0]}"
+                )
