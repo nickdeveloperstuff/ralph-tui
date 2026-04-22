@@ -469,6 +469,52 @@ class TestRichLogHorizontalFill:
             )
 
     @pytest.mark.asyncio
+    async def test_lines_written_after_resize_use_new_width(self, tmp_path):
+        """A line written before a widen+resize should be narrower than a line
+        written after. Guards against expand=True caching the mount-time width.
+        """
+        from ralph_tui.app import RalphApp
+        from ralph_tui.screens.runner_screen import TextChunk
+        cfg, screen = self._make_screen(tmp_path)
+        app = RalphApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.push_screen(screen)
+            await pilot.pause()
+
+            screen._on_text(TextChunk("A" * 400))
+            await pilot.pause()
+            await pilot.pause()
+            from textual.widgets import RichLog
+            log = screen.query_one("#output-log", RichLog)
+            # Snapshot a line rendered at the narrow width.
+            pre_len = log.lines[0].cell_length
+            pre_widget = log.size.width
+
+            await pilot.resize_terminal(240, 40)
+            await pilot.pause()
+            await pilot.pause()
+            screen._on_text(TextChunk("B" * 400))
+            await pilot.pause()
+            await pilot.pause()
+
+            # Find a line rendered from the post-resize 'B' stream.
+            b_lines = [
+                s for s in log.lines
+                if "BBBB" in (s.text if hasattr(s, "text") else "")
+            ]
+            assert b_lines, "no post-resize line rendered"
+            post_len = b_lines[0].cell_length
+            post_widget = log.size.width
+
+            assert post_widget > pre_widget, (
+                f"widget did not widen on resize: {pre_widget} -> {post_widget}"
+            )
+            assert post_len > pre_len + 50, (
+                f"post-resize line did not grow: pre={pre_len}, post={post_len} "
+                f"(widget {pre_widget} -> {post_widget})"
+            )
+
+    @pytest.mark.asyncio
     async def test_tool_end_timestamp_line_uses_expand_true(self, tmp_path):
         """The `[HH:MM:SS Done: X]` line is the second log.write() site in _on_activity.
 
