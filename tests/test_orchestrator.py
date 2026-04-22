@@ -622,6 +622,69 @@ class TestPlanUsageResume:
         assert result is False
 
     @pytest.mark.asyncio
+    async def test_plan_usage_uses_captured_session_id_when_result_session_blank(self, tmp_path):
+        """When error_info.session_id == '', the resume call must use captured_session_id from the stream."""
+        cfg = _make_config(tmp_path, min_iterations=1, max_iterations=1)
+        orch = Orchestrator(cfg)
+
+        # Skip the real multi-hour sleep.
+        async def fake_sleep_until_resume(retry_at, wait_seconds, is_plan):
+            return True
+
+        orch._sleep_until_resume = fake_sleep_until_resume  # type: ignore[method-assign]
+
+        query_calls = []
+
+        async def mock_query(prompt, options):
+            from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+            from claude_agent_sdk.types import StreamEvent
+            query_calls.append({"options": options})
+            if len(query_calls) == 1:
+                # StreamEvent publishes the real SDK session id
+                se = MagicMock(spec=StreamEvent)
+                se.session_id = "sess-from-stream"
+                se.event = {"type": "message_start", "message": {"usage": {}}}
+                yield se
+
+                a = MagicMock(spec=AssistantMessage)
+                a.error = "rate_limit"
+                b = MagicMock(spec=TextBlock)
+                b.text = "You've hit your session limit · resets 3:45pm"
+                a.content = [b]
+                yield a
+
+                # ResultMessage carries a blank session_id — the resume path must
+                # fall back to the captured StreamEvent id.
+                r = MagicMock(spec=ResultMessage)
+                r.is_error = True
+                r.session_id = ""
+                r.result = ""
+                r.total_cost_usd = 0.0
+                r.duration_ms = 0
+                r.num_turns = 0
+                yield r
+            else:
+                r = MagicMock(spec=ResultMessage)
+                r.is_error = False
+                r.session_id = "sess-from-stream"
+                r.result = "done"
+                r.total_cost_usd = 0.1
+                r.duration_ms = 100
+                r.num_turns = 1
+                yield r
+
+        with patch("ralph_tui.orchestrator.query", side_effect=mock_query), \
+             patch("ralph_tui.orchestrator.asyncio.sleep", new_callable=AsyncMock), \
+             patch("ralph_tui.orchestrator.analyze_output", new_callable=AsyncMock) as mock_analyze:
+            mock_analyze.return_value = MagicMock(should_stop=True, reason="done", summary="done")
+            await orch.run()
+
+        assert len(query_calls) >= 2
+        assert query_calls[1]["options"].resume == "sess-from-stream", (
+            f"resume fell back to empty id; got {query_calls[1]['options'].resume!r}"
+        )
+
+    @pytest.mark.asyncio
     @freeze_time("2026-04-21 01:00:00")  # Tuesday 01:00, so weekly-limit "Mon 12:00am" is ~6 days away
     async def test_plan_usage_wait_capped_at_6h(self, tmp_path):
         """If parsed reset is >> 6h away, wait_seconds must clamp to max_plan_usage_wait_seconds."""
