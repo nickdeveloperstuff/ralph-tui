@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch, call
 from dataclasses import dataclass
 
 import pytest
+from freezegun import freeze_time
 
 import json
 
@@ -619,6 +620,66 @@ class TestPlanUsageResume:
         with patch("ralph_tui.orchestrator.asyncio.sleep", new_callable=AsyncMock):
             result = await orch._sleep_until_resume(retry_at, 60, is_plan=True)
         assert result is False
+
+    @pytest.mark.asyncio
+    @freeze_time("2026-04-21 01:00:00")  # Tuesday 01:00, so weekly-limit "Mon 12:00am" is ~6 days away
+    async def test_plan_usage_wait_capped_at_6h(self, tmp_path):
+        """If parsed reset is >> 6h away, wait_seconds must clamp to max_plan_usage_wait_seconds."""
+        cfg = _make_config(tmp_path, min_iterations=1, max_iterations=1)
+        assert cfg.max_plan_usage_wait_seconds == 21600  # default, baseline assumption
+        orch = Orchestrator(cfg)
+
+        sleep_calls: list[tuple] = []
+
+        async def fake_sleep_until_resume(retry_at, wait_seconds, is_plan):
+            sleep_calls.append((retry_at, wait_seconds, is_plan))
+            return True  # fully slept
+
+        orch._sleep_until_resume = fake_sleep_until_resume  # type: ignore[method-assign]
+
+        query_calls = [0]
+
+        async def mock_query(prompt, options):
+            from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+            query_calls[0] += 1
+            if query_calls[0] == 1:
+                a = MagicMock(spec=AssistantMessage)
+                a.error = "rate_limit"
+                b = MagicMock(spec=TextBlock)
+                # ~6 days from frozen 'now', well past the 6h cap
+                b.text = "You've hit your weekly limit · resets Mon 12:00am"
+                a.content = [b]
+                yield a
+                r = MagicMock(spec=ResultMessage)
+                r.is_error = True
+                r.session_id = "sess-weekly"
+                r.result = ""
+                r.total_cost_usd = 0.0
+                r.duration_ms = 0
+                r.num_turns = 0
+                yield r
+            else:
+                r = MagicMock(spec=ResultMessage)
+                r.is_error = False
+                r.session_id = "sess-weekly"
+                r.result = "done"
+                r.total_cost_usd = 0.1
+                r.duration_ms = 100
+                r.num_turns = 1
+                yield r
+
+        with patch("ralph_tui.orchestrator.query", side_effect=mock_query), \
+             patch("ralph_tui.orchestrator.asyncio.sleep", new_callable=AsyncMock), \
+             patch("ralph_tui.orchestrator.analyze_output", new_callable=AsyncMock) as mock_analyze:
+            mock_analyze.return_value = MagicMock(should_stop=True, reason="done", summary="done")
+            await orch.run()
+
+        assert len(sleep_calls) == 1, f"expected exactly one plan-usage sleep, got {len(sleep_calls)}"
+        _, wait_seconds, is_plan = sleep_calls[0]
+        assert is_plan is True
+        assert wait_seconds == cfg.max_plan_usage_wait_seconds == 21600, (
+            f"wait should clamp to 6h (21600s); got {wait_seconds}"
+        )
 
 
 class TestHeartbeatIntegration:
