@@ -654,8 +654,8 @@ class TestErrorRecovery:
 
     @pytest.mark.asyncio
     async def test_non_retryable_error_skips_to_next_iteration(self, tmp_path):
-        """Auth/billing errors should skip to the next iteration."""
-        cfg = _make_config(tmp_path, min_iterations=1, max_iterations=3)
+        """Auth/billing errors should not retry internally, iteration is ineffective."""
+        cfg = _make_config(tmp_path, min_iterations=1, max_iterations=3, max_consecutive_errors=5)
         orch = Orchestrator(cfg)
         query_calls = []
 
@@ -664,7 +664,7 @@ class TestErrorRecovery:
             from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
             if len(query_calls) == 1:
-                # First iteration: auth error
+                # First iteration: auth error (non-retryable)
                 assistant = MagicMock(spec=AssistantMessage)
                 assistant.error = "authentication_failed"
                 text_block = MagicMock(spec=TextBlock)
@@ -697,16 +697,16 @@ class TestErrorRecovery:
             mock_analyze.return_value = MagicMock(should_stop=False, reason="continue", summary="continue")
             state = await orch.run()
 
-        # Should not retry iteration 1 — move straight to iteration 2
-        # Iteration 1 query + iteration 2 query + iteration 3 query = 3 calls (no retry)
-        assert len(query_calls) == 3
-        # First result should contain error info
+        # Auth error is non-retryable → 1 call. Then 3 effective iterations needed = 4 total calls.
+        assert len(query_calls) == 4
+        # First result should be ineffective
+        assert state.results[0].is_effective is False
         assert state.results[0].claude_response != ""
 
     @pytest.mark.asyncio
     async def test_max_error_retries_moves_on(self, tmp_path):
-        """After MAX_ERROR_RETRIES retries of the same iteration, move to next."""
-        cfg = _make_config(tmp_path, min_iterations=1, max_iterations=2)
+        """After max_consecutive_errors outer loop errors, circuit breaker fires."""
+        cfg = _make_config(tmp_path, min_iterations=1, max_iterations=2, max_consecutive_errors=3)
         orch = Orchestrator(cfg)
         query_calls = []
 
@@ -736,9 +736,11 @@ class TestErrorRecovery:
             mock_analyze.return_value = MagicMock(should_stop=False, reason="continue", summary="continue")
             state = await orch.run()
 
-        # Should not loop forever. max_error_retries=5 (default), so for 2 iterations:
-        # iter 1: 1 + 5 retries = 6, iter 2: 1 + 5 retries = 6 → 12 total max
-        assert len(query_calls) <= 12
+        # Circuit breaker at 3: each outer iteration does 1+5 retries = 6 calls.
+        # 3 outer iterations × 6 calls = 18 max
+        assert len(query_calls) <= 18
+        # Verify circuit breaker message
+        assert "Circuit breaker" in state.status
 
     @pytest.mark.asyncio
     async def test_context_exhaustion_restarts_fresh(self, tmp_path):
@@ -955,8 +957,12 @@ class TestConfigRetryLimitsUsed:
 
     @pytest.mark.asyncio
     async def test_config_retry_limits_used_by_orchestrator(self, tmp_path):
-        """Orchestrator should use config.max_error_retries instead of hardcoded constant."""
-        cfg = _make_config(tmp_path, min_iterations=1, max_iterations=1, max_error_retries=2)
+        """Orchestrator should use config.max_error_retries for inner loop,
+        and max_consecutive_errors for outer circuit breaker."""
+        cfg = _make_config(
+            tmp_path, min_iterations=1, max_iterations=1,
+            max_error_retries=2, max_consecutive_errors=2,
+        )
         orch = Orchestrator(cfg)
         query_calls = []
 
@@ -986,10 +992,12 @@ class TestConfigRetryLimitsUsed:
             mock_analyze.return_value = MagicMock(should_stop=True, reason="done", summary="done")
             state = await orch.run()
 
-        # With max_error_retries=2: retries increment then check >= limit
-        # Call 1 (original, error_retries becomes 1, < 2 so retry),
-        # Call 2 (retry, error_retries becomes 2, >= 2 so break) = 2 calls for iteration 1
-        assert len(query_calls) == 2
+        # max_error_retries=2: inner loop does 1 + 1 retry = 2 calls per outer iteration
+        # (error_retries goes 1, then 2 >= limit → break)
+        # max_consecutive_errors=2: circuit breaker fires after 2 outer iterations
+        # Total: 2 * 2 = 4 calls
+        assert len(query_calls) == 4
+        assert "Circuit breaker" in state.status
 
 
 class TestResumeFirstRetry:
@@ -1404,3 +1412,248 @@ class TestIterationDirCleanup:
         assert not (runs_dir / "iteration-001").exists(), "iteration-001 should be deleted"
         assert (runs_dir / "iteration-002").exists(), "iteration-002 should be kept as fallback"
         assert (runs_dir / "iteration-003").exists(), "iteration-003 should exist"
+
+
+class TestVerificationStopOverride:
+    """Tests for verification iteration never-stop logic."""
+
+    @pytest.mark.asyncio
+    async def test_verification_iteration_never_stops_early(self, tmp_path):
+        """Analyzer returning should_stop=True requires 2 consecutive non-verification stops."""
+        cfg = _make_config(
+            tmp_path,
+            min_iterations=1,
+            max_iterations=6,
+            verification_prompt="Verify all citations",
+            verification_interval=3,
+        )
+        orch = Orchestrator(cfg)
+        status_messages = []
+
+        async def capture_status(s):
+            status_messages.append(s)
+
+        orch._on_status = capture_status
+
+        async def mock_query(prompt, options):
+            from claude_agent_sdk import ResultMessage
+            result = MagicMock(spec=ResultMessage)
+            result.is_error = False
+            result.session_id = "sess"
+            result.result = "Full verification complete with zero discrepancies."
+            result.total_cost_usd = 0.01
+            result.duration_ms = 100
+            result.num_turns = 1
+            yield result
+
+        async def mock_analyze(text, sys_prompt, exit_prompt, iteration_context=None):
+            # Always say stop
+            return MagicMock(should_stop=True, reason="done", summary="done")
+
+        with patch("ralph_tui.orchestrator.query", side_effect=mock_query), \
+             patch("ralph_tui.orchestrator.analyze_output", side_effect=mock_analyze):
+            state = await orch.run()
+
+        # With 2-consecutive-stops: iter 1 → stop (1/2), iter 2 → stop (2/2) → break
+        assert len(state.results) == 2
+        assert state.consecutive_stops == 2
+
+    @pytest.mark.asyncio
+    async def test_verification_override_with_min_iterations(self, tmp_path):
+        """With min_iterations covering non-verify iters, verify iterations should not stop the loop."""
+        cfg = _make_config(
+            tmp_path,
+            min_iterations=3,
+            max_iterations=5,
+            verification_prompt="Verify all citations",
+            verification_interval=3,
+        )
+        orch = Orchestrator(cfg)
+        status_messages = []
+
+        async def capture_status(s):
+            status_messages.append(s)
+
+        orch._on_status = capture_status
+
+        async def mock_query(prompt, options):
+            from claude_agent_sdk import ResultMessage
+            result = MagicMock(spec=ResultMessage)
+            result.is_error = False
+            result.session_id = "sess"
+            result.result = "Verification complete. Zero discrepancies."
+            result.total_cost_usd = 0.01
+            result.duration_ms = 100
+            result.num_turns = 1
+            yield result
+
+        with patch("ralph_tui.orchestrator.query", side_effect=mock_query), \
+             patch("ralph_tui.orchestrator.analyze_output", new_callable=AsyncMock) as mock_analyze:
+            # Analyzer says stop — but effective iter 3 is verification, should override
+            mock_analyze.return_value = MagicMock(should_stop=True, reason="done", summary="done")
+            state = await orch.run()
+
+        # Effective 1,2 skip analysis (min=3). Effective 3 is verification → override.
+        # Effective 4: stop (1/2). Effective 5: stop (2/2) → break.
+        assert len(state.results) == 5, (
+            f"Expected 5 iterations (verify at 3 overridden, 2 consecutive stops at 4+5), "
+            f"got {len(state.results)}"
+        )
+        # Check that verification override message appeared
+        verify_msgs = [s for s in status_messages if "Verification complete" in s and "continuing" in s]
+        assert len(verify_msgs) >= 1, f"Expected verification override message: {status_messages}"
+
+    @pytest.mark.asyncio
+    async def test_normal_iteration_respects_should_stop(self, tmp_path):
+        """Analyzer returning should_stop=True on 2 consecutive non-verification iterations should stop."""
+        cfg = _make_config(
+            tmp_path,
+            min_iterations=1,
+            max_iterations=6,
+            verification_prompt="Verify all citations",
+            verification_interval=3,
+        )
+        orch = Orchestrator(cfg)
+
+        call_count = 0
+
+        async def mock_query(prompt, options):
+            nonlocal call_count
+            call_count += 1
+            from claude_agent_sdk import ResultMessage
+            result = MagicMock(spec=ResultMessage)
+            result.is_error = False
+            result.session_id = "sess"
+            result.result = "Done with work."
+            result.total_cost_usd = 0.01
+            result.duration_ms = 100
+            result.num_turns = 1
+            yield result
+
+        with patch("ralph_tui.orchestrator.query", side_effect=mock_query), \
+             patch("ralph_tui.orchestrator.analyze_output", new_callable=AsyncMock) as mock_analyze:
+            mock_analyze.return_value = MagicMock(should_stop=True, reason="done", summary="done")
+            state = await orch.run()
+
+        # 2 consecutive stops required: effective 1 → stop (1/2), effective 2 → stop (2/2) → break
+        assert len(state.results) == 2, (
+            f"Expected stop after 2 consecutive, got {len(state.results)} iterations"
+        )
+
+    @pytest.mark.asyncio
+    async def test_analyzer_receives_iteration_context(self, tmp_path):
+        """analyze_output should be called with iteration_context dict."""
+        cfg = _make_config(
+            tmp_path,
+            min_iterations=1,
+            max_iterations=2,
+            verification_prompt="Verify",
+            verification_interval=3,
+        )
+        orch = Orchestrator(cfg)
+
+        async def mock_query(prompt, options):
+            from claude_agent_sdk import ResultMessage
+            result = MagicMock(spec=ResultMessage)
+            result.is_error = False
+            result.session_id = "sess"
+            result.result = "Done"
+            result.total_cost_usd = 0.01
+            result.duration_ms = 100
+            result.num_turns = 1
+            yield result
+
+        with patch("ralph_tui.orchestrator.query", side_effect=mock_query), \
+             patch("ralph_tui.orchestrator.analyze_output", new_callable=AsyncMock) as mock_analyze:
+            mock_analyze.return_value = MagicMock(should_stop=False, reason="continue", summary="continue")
+            await orch.run()
+
+        # Check iteration_context was passed
+        for call_args in mock_analyze.call_args_list:
+            ctx = call_args.kwargs.get("iteration_context") or call_args[0][3] if len(call_args[0]) > 3 else call_args.kwargs.get("iteration_context")
+            assert ctx is not None, "iteration_context should be passed to analyze_output"
+            assert "iteration" in ctx
+            assert "max_iterations" in ctx
+            assert "is_verification" in ctx
+            assert "phase" in ctx
+            assert "remaining" in ctx
+
+    @pytest.mark.asyncio
+    async def test_state_file_tasks_included_in_context(self, tmp_path):
+        """When _ralph_state.json has tasks, task_summary should be in iteration_context."""
+        cfg = _make_config(
+            tmp_path,
+            min_iterations=1,
+            max_iterations=1,
+        )
+        orch = Orchestrator(cfg)
+
+        async def mock_query(prompt, options):
+            # Write a state file with tasks into the iteration dir
+            cwd = Path(options.cwd)
+            state = {
+                "iteration": 1,
+                "phase": "initial",
+                "tasks": [
+                    {"name": "task1", "status": "completed"},
+                    {"name": "task2", "status": "in_progress"},
+                    {"name": "task3", "status": "pending"},
+                ],
+                "citations_to_verify": [],
+                "key_findings": [],
+            }
+            (cwd / "_ralph_state.json").write_text(json.dumps(state))
+
+            from claude_agent_sdk import ResultMessage
+            result = MagicMock(spec=ResultMessage)
+            result.is_error = False
+            result.session_id = "sess"
+            result.result = "Done"
+            result.total_cost_usd = 0.01
+            result.duration_ms = 100
+            result.num_turns = 1
+            yield result
+
+        with patch("ralph_tui.orchestrator.query", side_effect=mock_query), \
+             patch("ralph_tui.orchestrator.analyze_output", new_callable=AsyncMock) as mock_analyze:
+            mock_analyze.return_value = MagicMock(should_stop=True, reason="done", summary="done")
+            await orch.run()
+
+        # Check that task_summary was passed
+        ctx = mock_analyze.call_args.kwargs.get("iteration_context")
+        assert ctx is not None
+        assert ctx["task_summary"] == "1/3 tasks completed"
+
+
+class TestReadTaskSummary:
+    """Tests for the _read_task_summary helper."""
+
+    def test_reads_tasks_from_state_file(self, tmp_path):
+        cfg = _make_config(tmp_path)
+        orch = Orchestrator(cfg)
+        state = {
+            "tasks": [
+                {"name": "a", "status": "completed"},
+                {"name": "b", "status": "completed"},
+                {"name": "c", "status": "pending"},
+            ]
+        }
+        (tmp_path / "_ralph_state.json").write_text(json.dumps(state))
+        assert orch._read_task_summary(tmp_path) == "2/3 tasks completed"
+
+    def test_returns_none_when_no_file(self, tmp_path):
+        cfg = _make_config(tmp_path)
+        orch = Orchestrator(cfg)
+        assert orch._read_task_summary(tmp_path) is None
+
+    def test_returns_none_when_no_tasks(self, tmp_path):
+        cfg = _make_config(tmp_path)
+        orch = Orchestrator(cfg)
+        (tmp_path / "_ralph_state.json").write_text('{"tasks": []}')
+        assert orch._read_task_summary(tmp_path) is None
+
+    def test_returns_none_on_invalid_json(self, tmp_path):
+        cfg = _make_config(tmp_path)
+        orch = Orchestrator(cfg)
+        (tmp_path / "_ralph_state.json").write_text("not json")
+        assert orch._read_task_summary(tmp_path) is None

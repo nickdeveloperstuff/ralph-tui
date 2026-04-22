@@ -147,6 +147,13 @@ class ConfigScreen(Screen):
             )
             yield TextArea(id="ta-verification-prompt")
 
+            yield Label("Max Consecutive Errors", classes="field-label")
+            yield Label(
+                "Circuit breaker: stop after this many consecutive SDK failures (default 10)",
+                classes="field-desc",
+            )
+            yield Input("10", id="in-max-consecutive-errors", type="integer")
+
             yield Label("Verification Interval", classes="field-label")
             yield Label(
                 "Every Nth iteration runs verification instead of drafting (0 = disabled)",
@@ -183,6 +190,7 @@ class ConfigScreen(Screen):
             max_rate_limit_retries=int(self.query_one("#in-max-rl-retries", Input).value or "10"),
             verification_prompt=self.query_one("#ta-verification-prompt", TextArea).text,
             verification_interval=int(self.query_one("#in-verification-interval", Input).value or "0"),
+            max_consecutive_errors=int(self.query_one("#in-max-consecutive-errors", Input).value or "10"),
         )
 
     def _load_config_to_form(self, config: RalphConfig) -> None:
@@ -200,6 +208,7 @@ class ConfigScreen(Screen):
         self.query_one("#in-max-rl-retries", Input).value = str(config.max_rate_limit_retries)
         self.query_one("#ta-verification-prompt", TextArea).text = config.verification_prompt
         self.query_one("#in-verification-interval", Input).value = str(config.verification_interval)
+        self.query_one("#in-max-consecutive-errors", Input).value = str(config.max_consecutive_errors)
 
     def _show_error(self, msg: str) -> None:
         self.query_one("#error-display", Static).update(msg)

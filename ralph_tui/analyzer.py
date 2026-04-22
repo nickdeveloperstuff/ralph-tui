@@ -35,6 +35,7 @@ async def analyze_output(
     claude_response_text: str,
     analysis_prompt: str,
     exit_condition_prompt: str,
+    iteration_context: dict | None = None,
 ) -> AnalysisResult:
     """Analyze Claude Code's natural language output using Gemini via OpenRouter.
 
@@ -43,6 +44,8 @@ async def analyze_output(
             said it did, in natural language.
         analysis_prompt: System prompt telling Gemini how to evaluate Claude's output.
         exit_condition_prompt: User prompt asking Gemini for a JSON verdict.
+        iteration_context: Optional dict with iteration, max_iterations, is_verification,
+            phase, remaining, and task_summary keys.
 
     Returns:
         AnalysisResult with should_stop, reason, and summary.
@@ -57,8 +60,30 @@ async def analyze_output(
             summary="Analysis skipped — no API key",
         )
 
+    context_block = ""
+    if iteration_context:
+        ctx = iteration_context
+        context_block = (
+            f"=== Iteration Context ===\n"
+            f"Iteration: {ctx['iteration']} of {ctx['max_iterations']}\n"
+            f"Phase: {ctx['phase']}\n"
+            f"Is verification iteration: {ctx['is_verification']}\n"
+            f"Iterations remaining: {ctx['remaining']}\n"
+        )
+        if ctx.get("task_summary"):
+            context_block += f"Task status: {ctx['task_summary']}\n"
+        if ctx["is_verification"]:
+            context_block += (
+                "\nIMPORTANT: This was a VERIFICATION checkpoint iteration. "
+                "Verification success means the document is accurate so far — "
+                "it does NOT mean the overall workflow is complete. "
+                "There are still drafting/review iterations remaining.\n"
+            )
+        context_block += "\n"
+
     user_content = (
-        f"=== Claude Code Response ===\n{claude_response_text}\n\n"
+        context_block
+        + f"=== Claude Code Response ===\n{claude_response_text}\n\n"
         f"=== Your Task ===\n{exit_condition_prompt}"
     )
 

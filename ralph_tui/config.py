@@ -10,17 +10,33 @@ import yaml
 
 
 DEFAULT_ANALYSIS_PROMPT = """\
-You are evaluating the natural language output of an AI coding assistant \
-(Claude Code). This is what Claude SAID about its work — not the source \
-code itself. Analyze the response for: reported errors, signs of incomplete \
-work, test failures mentioned, confidence level, and overall task completion \
-signals. Claude's output is unpredictable natural language, so use your \
-judgment to interpret it semantically."""
+You are evaluating the output of an AI assistant working through a \
+multi-iteration document creation workflow. The assistant works in phases: \
+initial drafting, iterative refinement, verification checkpoints, and \
+final review. You will receive iteration context telling you which phase \
+just completed and how many iterations remain.
+
+Analyze the response for: reported errors, signs of incomplete work, \
+quality of citations and reasoning, and whether the CURRENT PHASE's \
+objectives were met. Consider the remaining iteration schedule when \
+deciding whether to stop."""
 
 DEFAULT_EXIT_CONDITION_PROMPT = """\
-Based on your analysis of Claude Code's response text above, should the \
-orchestrator stop running (task appears complete) or continue with another \
-iteration? Return JSON only: {"should_stop": true/false, "reason": "explanation", "summary": "one-line summary"}"""
+Based on the iteration context and Claude's response above, should the \
+orchestrator stop or continue?
+
+Rules:
+- If iterations remain AND there is meaningful work left, continue.
+- If a verification iteration succeeded, that is NOT a reason to stop — \
+verification checkpoints confirm accuracy, they don't end the workflow.
+- Only recommend stopping if the task list is fully complete AND no \
+further phases are scheduled.
+- When in doubt, continue.
+- Note: The orchestrator requires 2 consecutive stop recommendations to \
+actually stop. If you recommend stopping, the next iteration will run as \
+confirmation. Only recommend stop if truly no meaningful work remains.
+
+Return JSON only: {"should_stop": true/false, "reason": "explanation", "summary": "one-line summary"}"""
 
 CONTEXT_MANAGEMENT_SUFFIX = """
 
@@ -97,6 +113,50 @@ In `_ralph_state.json`, update each citation's status:
 Also verify factual claims in the main document by independently searching discovery/source files.
 """
 
+CLAUDE_MD_VERIFICATION_TEMPLATE = """\
+# Ralph TUI - VERIFICATION Iteration (BLIND)
+You are NOT drafting. You are verifying prior work.
+The main document has been REMOVED to prevent contamination.
+
+## Startup
+1. Read _verification_manifest.json for your work order
+2. Read _document_index.md to find source files
+3. Do NOT read ._ralph_hidden/_claims.json until Phase B
+
+## Methodology
+
+### Phase A — Independent Source Review
+For each citation in _verification_manifest.json:
+1. Search assignment/ files for the source
+2. Read and summarize what the source actually says
+3. Record in _scratch_verification.md
+
+### Phase B — Compare Against Claims
+NOW read ._ralph_hidden/_claims.json
+Compare each claim against your Phase A findings
+Update _ralph_state.json with verified/disputed/unable_to_verify
+
+### Phase C — Generate Report
+Create _verification_report.md with summary stats and details
+
+## Output
+Generate _verification_report.md when done.
+
+## Context Management
+- Keep context under 50%. Run /compact at 40%.
+- NO subagents during verification.
+- Read files directly. Use grep/glob for searching.
+"""
+
+CONTEXT_RECOVERY_SUFFIX = """
+
+RECOVERY MODE: Previous sessions had context issues.
+- NO subagents. Read files directly.
+- Run /compact immediately after reading state file.
+- Complete ONE small task only.
+- Keep context under 30%.
+"""
+
 
 @dataclass
 class RalphConfig:
@@ -116,6 +176,7 @@ class RalphConfig:
     max_rate_limit_retries: int = 10  # was hardcoded 5
     verification_prompt: str = ""   # User-specified what to verify (empty = disabled)
     verification_interval: int = 0  # 0 = disabled, N = every Nth iteration is verification
+    max_consecutive_errors: int = 10  # circuit breaker after escalating backoffs
 
     def validate(self) -> list[str]:
         """Return list of validation errors, empty if valid."""

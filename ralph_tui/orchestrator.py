@@ -30,7 +30,11 @@ from claude_agent_sdk.types import StreamEvent
 from claude_agent_sdk._errors import MessageParseError
 
 from ralph_tui.analyzer import AnalysisResult, analyze_output
-from ralph_tui.config import RalphConfig, CONTEXT_MANAGEMENT_SUFFIX, CLAUDE_MD_TEMPLATE
+from ralph_tui.config import (
+    RalphConfig, CONTEXT_MANAGEMENT_SUFFIX, CLAUDE_MD_TEMPLATE,
+    CLAUDE_MD_VERIFICATION_TEMPLATE, CONTEXT_RECOVERY_SUFFIX,
+    VERIFICATION_METHODOLOGY_TEMPLATE,
+)
 from ralph_tui.error_handling import ErrorType, ErrorInfo, detect_error
 from ralph_tui.rate_limit import detect_rate_limit
 
@@ -62,6 +66,8 @@ class IterationResult:
     num_turns: int
     analysis: AnalysisResult | None  # None if below min_iterations
     skipped_analysis: bool  # True when below min_iterations
+    effective_iteration: int = 0   # 0 if ineffective, else the Nth effective iteration
+    is_effective: bool = True      # True if real work was done
 
 
 @dataclass
@@ -71,6 +77,9 @@ class OrchestratorState:
     total_cost_usd: float = 0.0
     start_time: float = 0.0
     results: list[IterationResult] = field(default_factory=list)
+    effective_iterations: int = 0       # count of productive iterations
+    consecutive_errors: int = 0         # for escalating backoff
+    consecutive_stops: int = 0          # for "2 consecutive stops" end criteria
 
 
 @dataclass
@@ -161,6 +170,8 @@ RALPH_STATE_TEMPLATE = """\
 
 RALPH_INTERNAL_FILES = {
     "_ralph_state.json", "_document_index.md", "CLAUDE.md",
+    "_verification_manifest.json", "_verification_report.md",
+    "._ralph_hidden",
 }
 
 
@@ -273,6 +284,7 @@ class Orchestrator:
         self._on_usage = on_usage
         self._last_usage_info: UsageInfo | None = None
         self._current_log_file: Path | None = None
+        self._pending_verification_feedback: str | None = None
 
     async def _notify_status(self, status: str) -> None:
         self.state.status = status
@@ -335,6 +347,140 @@ class Orchestrator:
         with open(log_file, "a") as f:
             f.write(json.dumps(entry) + "\n")
 
+    def _is_effective(self, cost_usd: float, last_error_type: str | None) -> bool:
+        """An iteration is effective if Claude did real work (cost > 0, no error)."""
+        return cost_usd > 0.0 and last_error_type is None
+
+    async def _kill_zombie_claude_processes(self) -> None:
+        """Kill any lingering claude CLI processes that may block new sessions."""
+        try:
+            result = await asyncio.to_thread(
+                _subprocess.run,
+                ["pkill", "-f", "claude"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                await self._notify_text("\n[Killed zombie claude processes]\n")
+        except (FileNotFoundError, _subprocess.TimeoutExpired):
+            pass
+
+    def _get_backoff_wait(self, consecutive_errors: int) -> int:
+        """Return wait time in seconds based on consecutive error count."""
+        if consecutive_errors <= 2:
+            return 60
+        elif consecutive_errors == 3:
+            return 300  # 5 minutes
+        elif consecutive_errors == 4:
+            return 600  # 10 minutes
+        else:
+            return 900  # 15 minutes
+
+    def _prepare_verification_dir(self, iter_dir: Path) -> None:
+        """Move main document and scratch files into ._ralph_hidden/ for blind verification."""
+        hidden = iter_dir / "._ralph_hidden"
+        hidden.mkdir(exist_ok=True)
+
+        # Move all root-level non-Ralph, non-directory files (the main document)
+        for item in iter_dir.iterdir():
+            if item.is_dir():
+                continue
+            name = item.name
+            # Skip Ralph internal files and scratch files
+            if name in RALPH_INTERNAL_FILES:
+                continue
+            if name.startswith("_scratch_"):
+                # Move scratch files to hidden
+                shutil.move(str(item), str(hidden / name))
+                continue
+            if name.startswith(".") or name.startswith("_"):
+                continue
+            # This is a user file (main document) — move it
+            shutil.move(str(item), str(hidden / name))
+
+        # Extract claims from _ralph_state.json → write _claims.json
+        state_file = iter_dir / "_ralph_state.json"
+        if state_file.exists():
+            try:
+                state = json.loads(state_file.read_text())
+                citations = state.get("citations_to_verify", [])
+
+                # Write claims file (full citations with claims)
+                claims = [
+                    {"citation": c.get("citation", ""), "claim": c.get("claim", ""), "status": c.get("status", "")}
+                    for c in citations if isinstance(c, dict)
+                ]
+                (hidden / "_claims.json").write_text(json.dumps(claims, indent=2))
+
+                # Write verification manifest (citation refs ONLY, no claims)
+                manifest = [
+                    {"citation": c.get("citation", ""), "status": c.get("status", "")}
+                    for c in citations if isinstance(c, dict)
+                ]
+                (iter_dir / "_verification_manifest.json").write_text(json.dumps(manifest, indent=2))
+
+                # Redact _ralph_state.json: remove claim field from citations
+                for c in citations:
+                    if isinstance(c, dict):
+                        c.pop("claim", None)
+                state_file.write_text(json.dumps(state, indent=2))
+
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    def _restore_from_hidden(self, iter_dir: Path) -> None:
+        """Restore files from ._ralph_hidden/ back to iteration dir root."""
+        hidden = iter_dir / "._ralph_hidden"
+        if not hidden.exists():
+            return
+        for item in hidden.iterdir():
+            dest = iter_dir / item.name
+            if dest.exists():
+                if dest.is_dir():
+                    shutil.rmtree(dest)
+                else:
+                    dest.unlink()
+            shutil.move(str(item), str(dest))
+        # Remove the now-empty hidden dir
+        try:
+            hidden.rmdir()
+        except OSError:
+            pass
+        # Clean up verification manifest
+        manifest = iter_dir / "_verification_manifest.json"
+        if manifest.exists():
+            manifest.unlink()
+
+    def _build_verification_feedback(self, iter_dir: Path) -> str | None:
+        """Read verification results and format feedback for next drafting iteration."""
+        state_file = iter_dir / "_ralph_state.json"
+        if not state_file.exists():
+            return None
+        try:
+            state = json.loads(state_file.read_text())
+            citations = state.get("citations_to_verify", [])
+            issues = []
+            for c in citations:
+                if not isinstance(c, dict):
+                    continue
+                status = c.get("status", "")
+                citation_ref = c.get("citation", "unknown")
+                if status == "disputed":
+                    disc = c.get("discrepancy", "no details")
+                    issues.append(f"- [{citation_ref}] — DISPUTED: {disc}")
+                elif status == "unable_to_verify":
+                    reason = c.get("reason", "no details")
+                    issues.append(f"- [{citation_ref}] — UNABLE TO VERIFY: {reason}")
+
+            if not issues:
+                return None
+
+            return (
+                "\n## VERIFICATION FINDINGS — ADDRESS THESE FIRST\n"
+                + "\n".join(issues) + "\n"
+            )
+        except (json.JSONDecodeError, OSError):
+            return None
+
     def _select_prompt(self, iteration: int) -> str:
         """Select the prompt for a given iteration number.
 
@@ -356,7 +502,6 @@ class Orchestrator:
                 and self.config.verification_prompt
                 and iteration > 1
                 and iteration % self.config.verification_interval == 0):
-            from ralph_tui.config import VERIFICATION_METHODOLOGY_TEMPLATE
             base = VERIFICATION_METHODOLOGY_TEMPLATE.format(
                 verification_prompt=self.config.verification_prompt
             )
@@ -377,6 +522,21 @@ class Orchestrator:
         """Signal the orchestrator to stop after current iteration."""
         self._stop_event.set()
 
+    def _read_task_summary(self, iter_dir: Path) -> str | None:
+        """Read _ralph_state.json and return a one-line task summary."""
+        state_file = iter_dir / "_ralph_state.json"
+        if not state_file.exists():
+            return None
+        try:
+            state = json.loads(state_file.read_text())
+            tasks = state.get("tasks", [])
+            if not tasks:
+                return None
+            done = sum(1 for t in tasks if isinstance(t, dict) and t.get("status") == "completed")
+            return f"{done}/{len(tasks)} tasks completed"
+        except (json.JSONDecodeError, OSError):
+            return None
+
     def _log_iteration(
         self, log_file: Path, result: IterationResult, error_type: str | None = None,
         usage: UsageInfo | None = None,
@@ -385,6 +545,8 @@ class Orchestrator:
         entry = {
             "timestamp": datetime.now().isoformat(),
             "iteration": result.iteration,
+            "effective_iteration": result.effective_iteration,
+            "is_effective": result.is_effective,
             "status": "error" if error_type else "ok",
             "error_type": error_type,
             "cost_usd": result.cost_usd,
@@ -403,7 +565,12 @@ class Orchestrator:
             f.write(json.dumps(entry) + "\n")
 
     async def run(self) -> OrchestratorState:
-        """Execute the full orchestration loop."""
+        """Execute the full orchestration loop.
+
+        Uses effective iteration counting: only iterations where Claude did real work
+        (cost > 0, no errors) count toward min/max/transition/verification thresholds.
+        Escalating backoff on consecutive errors. Two consecutive stops required to end.
+        """
         self.state = OrchestratorState(start_time=time.time())
         project_path = Path(self.config.project_path).expanduser().resolve()
         # Place runs dir as a sibling to avoid recursive copy issues
@@ -412,32 +579,61 @@ class Orchestrator:
         log_file = runs_dir / "ralph-log.jsonl"
         self._current_log_file = log_file
 
-        for iteration in range(1, self.config.max_iterations + 1):
+        raw_iteration = 0
+
+        while self.state.effective_iterations < self.config.max_iterations:
             if self._stop_event.is_set():
                 await self._notify_status("Stopped by user")
                 break
 
-            self.state.current_iteration = iteration
-            iter_dir = runs_dir / f"iteration-{iteration:03d}"
+            raw_iteration += 1
+            self.state.current_iteration = raw_iteration
+            iter_dir = runs_dir / f"iteration-{raw_iteration:03d}"
+
+            # Prospective effective iteration (if this one succeeds)
+            prospective_effective = self.state.effective_iterations + 1
 
             # 1. Copy folder
-            await self._notify_status(f"Copying project (iteration {iteration})")
-            if iteration == 1:
+            await self._notify_status(
+                f"Copying project (raw {raw_iteration}, effective {self.state.effective_iterations})"
+            )
+            if raw_iteration == 1:
                 src = project_path
             else:
-                src = runs_dir / f"iteration-{iteration - 1:03d}"
+                src = runs_dir / f"iteration-{raw_iteration - 1:03d}"
 
             await asyncio.to_thread(_copy_project, src, iter_dir)
-            _inject_claude_md(iter_dir)
+
+            # Restore hidden files from verification iteration (if prev was verification)
+            self._restore_from_hidden(iter_dir)
+
+            # Determine if this will be a verification iteration (using effective count)
+            is_verification = (
+                self.config.verification_interval > 0
+                and bool(self.config.verification_prompt)
+                and prospective_effective > 1
+                and prospective_effective % self.config.verification_interval == 0
+            )
+
+            if is_verification:
+                # Write verification-specific CLAUDE.md
+                (iter_dir / "CLAUDE.md").write_text(CLAUDE_MD_VERIFICATION_TEMPLATE)
+                # Prepare blind verification directory structure
+                self._prepare_verification_dir(iter_dir)
+            else:
+                # Always write standard template (overwrite any verification template
+                # carried forward from previous iteration copy)
+                (iter_dir / "CLAUDE.md").write_text(CLAUDE_MD_TEMPLATE)
+
             _inject_state_file(iter_dir)
 
-            # Generate document index on first iteration only
-            if iteration == 1:
+            # Generate document index on first raw iteration only
+            if raw_iteration == 1:
                 await asyncio.to_thread(_generate_document_index, project_path, iter_dir)
 
             # Clean up prior iteration dirs (keep N-1 as fallback)
-            if iteration > 2:
-                for prev in range(1, iteration - 1):
+            if raw_iteration > 2:
+                for prev in range(1, raw_iteration - 1):
                     prev_dir = runs_dir / f"iteration-{prev:03d}"
                     if prev_dir.exists():
                         try:
@@ -445,12 +641,27 @@ class Orchestrator:
                         except OSError:
                             pass  # Best-effort cleanup
 
-            # 2. Select prompt (three-phase system)
-            prompt = self._select_prompt(iteration)
+            # 2. Select prompt (using effective iteration count)
+            prompt = self._select_prompt(prospective_effective)
+
+            # Prepend verification feedback if available
+            if self._pending_verification_feedback and not is_verification:
+                prompt = self._pending_verification_feedback + "\n" + prompt
+                self._pending_verification_feedback = None
+
+            # Append context recovery suffix if in recovery mode
+            if self.state.consecutive_errors >= 3:
+                prompt += CONTEXT_RECOVERY_SUFFIX
 
             # 3. Run Claude Code via SDK (with rate-limit retry)
-            await self._notify_status(f"Running Claude (iteration {iteration})")
-            await self._notify_text(f"\n{'='*60}\n ITERATION {iteration}\n{'='*60}\n")
+            await self._notify_status(
+                f"Running Claude (raw {raw_iteration}, effective {prospective_effective})"
+            )
+            await self._notify_text(
+                f"\n{'='*60}\n ITERATION {raw_iteration} "
+                f"(effective {prospective_effective})"
+                f"{' [VERIFICATION]' if is_verification else ''}\n{'='*60}\n"
+            )
 
             claude_response, cost, duration_ms, num_turns, last_error_type = (
                 await self._run_claude(iter_dir, prompt)
@@ -458,46 +669,142 @@ class Orchestrator:
 
             self.state.total_cost_usd += cost
 
-            # 4. Analyze or skip
+            # Determine effectiveness
+            effective = self._is_effective(cost, last_error_type)
+
+            if effective:
+                self.state.effective_iterations += 1
+                effective_num = self.state.effective_iterations
+                self.state.consecutive_errors = 0
+
+                # Collect verification feedback after a verification iteration
+                if is_verification:
+                    self._pending_verification_feedback = self._build_verification_feedback(iter_dir)
+            else:
+                effective_num = 0
+                self.state.consecutive_errors += 1
+
+                # Circuit breaker
+                if self.state.consecutive_errors >= self.config.max_consecutive_errors:
+                    await self._notify_status(
+                        f"Circuit breaker: {self.state.consecutive_errors} consecutive errors"
+                    )
+                    await self._notify_text(
+                        f"\n[CIRCUIT BREAKER: {self.state.consecutive_errors} consecutive "
+                        f"errors — stopping]\n"
+                    )
+                    break
+
+                # Escalating backoff
+                wait_seconds = self._get_backoff_wait(self.state.consecutive_errors)
+                await self._notify_text(
+                    f"\n[Error #{self.state.consecutive_errors}: waiting {wait_seconds}s "
+                    f"before retry]\n"
+                )
+
+                # Kill zombies on 3+ consecutive errors
+                if self.state.consecutive_errors >= 3:
+                    await self._kill_zombie_claude_processes()
+
+                for remaining in range(wait_seconds, 0, -1):
+                    await self._notify_status(
+                        f"Backoff: retry in {remaining}s "
+                        f"(error {self.state.consecutive_errors}/"
+                        f"{self.config.max_consecutive_errors})"
+                    )
+                    await asyncio.sleep(1)
+                    if self._stop_event.is_set():
+                        break
+
+            # 4. Analyze or skip (only for effective iterations)
             analysis: AnalysisResult | None = None
             skipped = False
 
-            if iteration < self.config.min_iterations:
+            if not effective:
+                skipped = True
+            elif effective_num < self.config.min_iterations:
                 skipped = True
                 await self._notify_status(
-                    f"Iteration {iteration} < min ({self.config.min_iterations}), skipping analysis"
+                    f"Effective iteration {effective_num} < min ({self.config.min_iterations}), "
+                    f"skipping analysis"
                 )
             elif not self._stop_event.is_set():
-                await self._notify_status(f"Analyzing output (iteration {iteration})")
+                await self._notify_status(f"Analyzing output (effective {effective_num})")
+
+                # Determine phase name
+                if effective_num == 1:
+                    phase = "initial"
+                elif is_verification:
+                    phase = "verification"
+                elif (self.config.transition_iteration > 0
+                      and effective_num >= self.config.transition_iteration):
+                    phase = "final"
+                else:
+                    phase = "rerun"
+
+                # Read task summary from state file if available
+                task_summary = self._read_task_summary(iter_dir)
+
+                iteration_context = {
+                    "iteration": effective_num,
+                    "raw_iteration": raw_iteration,
+                    "max_iterations": self.config.max_iterations,
+                    "is_verification": is_verification,
+                    "phase": phase,
+                    "remaining": self.config.max_iterations - effective_num,
+                    "task_summary": task_summary,
+                }
+
                 analysis = await analyze_output(
                     claude_response,
                     self.config.analysis_prompt,
                     self.config.exit_condition_prompt,
+                    iteration_context=iteration_context,
                 )
 
             # 5. Record result
             result = IterationResult(
-                iteration=iteration,
+                iteration=raw_iteration,
                 claude_response=claude_response,
                 cost_usd=cost,
                 duration_ms=duration_ms,
                 num_turns=num_turns,
                 analysis=analysis,
                 skipped_analysis=skipped,
+                effective_iteration=effective_num,
+                is_effective=effective,
             )
             self.state.results.append(result)
             self._log_iteration(log_file, result, error_type=last_error_type, usage=self._last_usage_info)
             if self._on_iteration_done:
                 await self._on_iteration_done(result)
 
-            # 6. Decide whether to continue
-            if analysis and analysis.should_stop:
-                await self._notify_status(
-                    f"Completed after {iteration} iterations: {analysis.summary}"
-                )
-                break
+            # 6. Decide whether to continue (2 consecutive stops required)
+            if effective and not is_verification:
+                if analysis and analysis.should_stop:
+                    self.state.consecutive_stops += 1
+                    if self.state.consecutive_stops >= 2:
+                        await self._notify_status(
+                            f"Completed after {effective_num} effective iterations "
+                            f"(2 consecutive stops): {analysis.summary}"
+                        )
+                        break
+                    else:
+                        await self._notify_status(
+                            f"Analyzer says stop (1/2 needed). Running one more to confirm."
+                        )
+                else:
+                    self.state.consecutive_stops = 0
+            elif effective and is_verification:
+                # Verification iterations don't affect consecutive_stops
+                if analysis and analysis.should_stop:
+                    await self._notify_status(
+                        f"Verification complete (effective {effective_num}), continuing workflow"
+                    )
         else:
-            await self._notify_status(f"Reached max iterations ({self.config.max_iterations})")
+            await self._notify_status(
+                f"Reached max effective iterations ({self.config.max_iterations})"
+            )
 
         return self.state
 
