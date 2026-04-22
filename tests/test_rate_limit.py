@@ -4,11 +4,13 @@ from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
+from freezegun import freeze_time
 
 from ralph_tui.rate_limit import (
     RateLimitInfo,
     detect_rate_limit,
     parse_retry_time,
+    _parse_reset_clause,
 )
 
 
@@ -111,3 +113,70 @@ class TestParseRetryTime:
         expected_min2 = before2 + timedelta(minutes=13) - timedelta(seconds=2)
         expected_max2 = after2 + timedelta(minutes=13) + timedelta(seconds=2)
         assert expected_min2 <= info.retry_at <= expected_max2
+
+
+class TestPlanUsageDetection:
+    @freeze_time("2026-04-21 14:00:00")
+    def test_detect_plan_usage_session_limit(self):
+        """5-hour session limit with absolute-clock reset."""
+        text = "You've hit your session limit · resets 3:45pm"
+        messages = [_make_assistant_message(error=None, text=text)]
+        result = _make_result_message(is_error=False, session_id="sess-s")
+        info = detect_rate_limit(messages, result)
+        assert info is not None
+        assert info.kind == "plan_usage"
+        # 15:45 today + 3min buffer = 15:48 today
+        assert info.retry_at == datetime(2026, 4, 21, 15, 48, 0)
+
+    @freeze_time("2026-04-22 12:00:00")  # Wednesday
+    def test_detect_plan_usage_weekly_limit(self):
+        """Weekly limit rolls to the named weekday."""
+        text = "You've hit your weekly limit · resets Mon 12:00am"
+        messages = [_make_assistant_message(error=None, text=text)]
+        result = _make_result_message(is_error=False, session_id="sess-w")
+        info = detect_rate_limit(messages, result)
+        assert info is not None
+        assert info.kind == "plan_usage"
+        # 2026-04-22 is a Wednesday. Next Monday 00:00 + 3min buffer.
+        assert info.retry_at == datetime(2026, 4, 27, 0, 3, 0)
+
+    @freeze_time("2026-04-21 14:00:00")
+    def test_detect_plan_usage_opus_limit(self):
+        text = "You've hit your Opus limit · resets 3:45pm"
+        messages = [_make_assistant_message(error=None, text=text)]
+        result = _make_result_message(is_error=False, session_id="sess-o")
+        info = detect_rate_limit(messages, result)
+        assert info is not None
+        assert info.kind == "plan_usage"
+        assert info.retry_at == datetime(2026, 4, 21, 15, 48, 0)
+
+    @freeze_time("2026-04-21 16:00:00")
+    def test_absolute_time_rolls_to_tomorrow(self):
+        """When now > reset clock, parse_retry_time rolls 'at 3:45pm' to tomorrow."""
+        text = "Retry at 3:45 PM"
+        dt = parse_retry_time(text)
+        assert dt is not None
+        assert dt == datetime(2026, 4, 22, 15, 45, 0)
+
+    @freeze_time("2026-04-21 15:45:00")
+    def test_reset_time_exactly_now_rolls_forward(self):
+        """Boundary: candidate == now must roll forward (uses <=, not <)."""
+        parsed = _parse_reset_clause("3:45pm")
+        assert parsed == datetime(2026, 4, 22, 15, 45, 0)
+
+    @freeze_time("2026-04-21 14:00:00")
+    def test_plan_usage_lowercase_pm_no_space(self):
+        """Message format ships tight: '3:45pm' with no space before pm."""
+        text = "You've hit your session limit · resets 3:45pm"
+        messages = [_make_assistant_message(error=None, text=text)]
+        result = _make_result_message(is_error=False, session_id="s")
+        info = detect_rate_limit(messages, result)
+        assert info is not None and info.kind == "plan_usage"
+
+    def test_api_rate_limit_keeps_kind_api(self):
+        """Plain SDK rate_limit with no plan-usage phrase stays kind='api_rate_limit'."""
+        messages = [_make_assistant_message(error="rate_limit", text="try again in 5 minutes")]
+        result = _make_result_message(is_error=True, session_id="sess-api")
+        info = detect_rate_limit(messages, result)
+        assert info is not None
+        assert info.kind == "api_rate_limit"

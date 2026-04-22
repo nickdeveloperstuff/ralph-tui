@@ -468,6 +468,159 @@ class TestRateLimitRecovery:
         assert len(state.results) >= 1
 
 
+class TestPlanUsageResume:
+    """Auto-resume behavior for Claude Code plan-usage limits (session/weekly/Opus)."""
+
+    @pytest.mark.asyncio
+    async def test_run_claude_waits_through_plan_usage_limit(self, tmp_path):
+        """Plan-usage hit + subsequent success: resume same session, no 'giving up'."""
+        cfg = _make_config(tmp_path, min_iterations=1, max_iterations=1)
+        text_output: list[str] = []
+
+        async def capture_text(t):
+            text_output.append(t)
+
+        orch = Orchestrator(cfg, on_text=capture_text)
+        query_calls = []
+
+        async def mock_query(prompt, options):
+            from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+            query_calls.append({"options": options})
+            if len(query_calls) == 1:
+                assistant = MagicMock(spec=AssistantMessage)
+                assistant.error = "rate_limit"
+                block = MagicMock(spec=TextBlock)
+                block.text = "You've hit your session limit · resets 3:45pm"
+                assistant.content = [block]
+                yield assistant
+
+                result = MagicMock(spec=ResultMessage)
+                result.is_error = True
+                result.session_id = "sess-plan-xyz"
+                result.result = ""
+                result.total_cost_usd = 0.01
+                result.duration_ms = 100
+                result.num_turns = 1
+                yield result
+            else:
+                result = MagicMock(spec=ResultMessage)
+                result.is_error = False
+                result.session_id = "sess-plan-xyz"
+                result.result = "Finished!"
+                result.total_cost_usd = 0.5
+                result.duration_ms = 2000
+                result.num_turns = 5
+                yield result
+
+        with patch("ralph_tui.orchestrator.query", side_effect=mock_query), \
+             patch("ralph_tui.orchestrator.asyncio.sleep", new_callable=AsyncMock), \
+             patch("ralph_tui.orchestrator.analyze_output", new_callable=AsyncMock) as mock_analyze:
+            mock_analyze.return_value = MagicMock(should_stop=True, reason="done", summary="done")
+            await orch.run()
+
+        assert len(query_calls) >= 2, f"expected resume call, got {len(query_calls)}"
+        assert query_calls[1]["options"].resume == "sess-plan-xyz"
+        joined = "".join(text_output)
+        assert "Plan usage limit hit" in joined
+        assert "Resumed at" in joined
+        assert "giving up" not in joined.lower()
+
+    @pytest.mark.asyncio
+    async def test_run_claude_plan_usage_does_not_count_toward_api_cap(self, tmp_path):
+        """Many plan-usage hits in a row must not trigger the 5-retry API cap."""
+        cfg = _make_config(tmp_path, min_iterations=1, max_iterations=1, max_rate_limit_retries=3)
+        orch = Orchestrator(cfg)
+        query_calls = [0]
+
+        async def mock_query(prompt, options):
+            from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+            query_calls[0] += 1
+            if query_calls[0] <= 6:
+                a = MagicMock(spec=AssistantMessage)
+                a.error = "rate_limit"
+                b = MagicMock(spec=TextBlock)
+                b.text = "You've hit your session limit · resets 3:45pm"
+                a.content = [b]
+                yield a
+                r = MagicMock(spec=ResultMessage)
+                r.is_error = True
+                r.session_id = "sess-p"
+                r.result = ""
+                r.total_cost_usd = 0.0
+                r.duration_ms = 0
+                r.num_turns = 0
+                yield r
+            else:
+                r = MagicMock(spec=ResultMessage)
+                r.is_error = False
+                r.session_id = "sess-p"
+                r.result = "Done!"
+                r.total_cost_usd = 0.1
+                r.duration_ms = 100
+                r.num_turns = 1
+                yield r
+
+        with patch("ralph_tui.orchestrator.query", side_effect=mock_query), \
+             patch("ralph_tui.orchestrator.asyncio.sleep", new_callable=AsyncMock), \
+             patch("ralph_tui.orchestrator.analyze_output", new_callable=AsyncMock) as mock_analyze:
+            mock_analyze.return_value = MagicMock(should_stop=True, reason="done", summary="done")
+            await orch.run()
+
+        # We expect to have survived all 6 plan-usage hits and then succeeded on the 7th.
+        assert query_calls[0] >= 7, (
+            f"plan_usage should not consume the API cap; got only {query_calls[0]} queries"
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_claude_api_429_still_capped(self, tmp_path):
+        """Plain api_rate_limit errors must still hit the 5-retry cap with 'giving up' text."""
+        cfg = _make_config(tmp_path, min_iterations=1, max_iterations=1, max_rate_limit_retries=3)
+        text_output: list[str] = []
+
+        async def capture_text(t):
+            text_output.append(t)
+
+        orch = Orchestrator(cfg, on_text=capture_text)
+
+        async def always_api_429(prompt, options):
+            from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+            a = MagicMock(spec=AssistantMessage)
+            a.error = "rate_limit"
+            b = MagicMock(spec=TextBlock)
+            b.text = "rate limited, try again in 1 minutes"
+            a.content = [b]
+            yield a
+            r = MagicMock(spec=ResultMessage)
+            r.is_error = True
+            r.session_id = "sess-api"
+            r.result = ""
+            r.total_cost_usd = 0.0
+            r.duration_ms = 0
+            r.num_turns = 0
+            yield r
+
+        with patch("ralph_tui.orchestrator.query", side_effect=always_api_429), \
+             patch("ralph_tui.orchestrator.asyncio.sleep", new_callable=AsyncMock), \
+             patch("ralph_tui.orchestrator.analyze_output", new_callable=AsyncMock) as mock_analyze:
+            mock_analyze.return_value = MagicMock(should_stop=True, reason="done", summary="done")
+            await orch.run()
+
+        joined = "".join(text_output)
+        assert "giving up" in joined.lower()
+
+    @pytest.mark.asyncio
+    async def test_sleep_until_resume_respects_stop_event(self, tmp_path):
+        """_sleep_until_resume must bail out when _stop_event is set."""
+        from datetime import datetime, timedelta
+        cfg = _make_config(tmp_path)
+        orch = Orchestrator(cfg)
+        orch._stop_event.set()
+        retry_at = datetime.now() + timedelta(seconds=60)
+        with patch("ralph_tui.orchestrator.asyncio.sleep", new_callable=AsyncMock):
+            result = await orch._sleep_until_resume(retry_at, 60, is_plan=True)
+        assert result is False
+
+
 class TestHeartbeatIntegration:
     @pytest.mark.asyncio
     async def test_heartbeat_fires_on_stall(self, tmp_path):

@@ -18,7 +18,7 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk._errors import MessageParseError
 
-from ralph_tui.rate_limit import detect_rate_limit, RateLimitInfo
+from ralph_tui.rate_limit import detect_rate_limit, RateLimitInfo, RateLimitKind
 
 
 class ErrorType(enum.Enum):
@@ -57,6 +57,7 @@ class ErrorInfo:
     session_id: str = ""
     raw_message: str = ""
     retry_at: datetime | None = None  # Only set for rate limits
+    rate_limit_kind: RateLimitKind | None = None  # Only set for rate limits
 
 
 def _is_context_exhausted(text: str) -> bool:
@@ -115,6 +116,7 @@ def detect_error(
                 rl_info = detect_rate_limit(messages, result_message)
                 if rl_info:
                     info.retry_at = rl_info.retry_at
+                    info.rate_limit_kind = rl_info.kind
 
             return info
 
@@ -146,6 +148,7 @@ def detect_error(
                 session_id=rl_info.session_id,
                 raw_message=rl_info.raw_message,
                 retry_at=rl_info.retry_at,
+                rate_limit_kind=rl_info.kind,
             )
 
     return None

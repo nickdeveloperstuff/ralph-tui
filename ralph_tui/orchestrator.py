@@ -10,7 +10,7 @@ import shutil
 import subprocess as _subprocess
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Awaitable
 
@@ -47,6 +47,8 @@ CANCEL_GRACE_SEC = 5   # wait for SDK cleanup before force-killing children
 MAX_RATE_LIMIT_RETRIES = 5
 MAX_ERROR_RETRIES = 3
 ERROR_RETRY_WAIT_SEC = 30
+MAX_PLAN_USAGE_WAIT_SEC = 6 * 3600  # Safety cap: never sleep longer than this for a plan-usage reset
+PLAN_USAGE_TICK_SEC = 10             # Coarse tick during multi-hour plan-usage waits to keep log spam low
 MODEL_CONTEXT_WINDOW = 200_000  # claude-opus-4-6
 
 
@@ -882,8 +884,49 @@ class Orchestrator:
                 )
                 break
 
-            # Rate limit — special handling: wait + resume same session
+            # Rate limit — special handling: wait + resume same session.
+            # Plan-usage limits (session/weekly/Opus) ignore the API-429 retry cap
+            # because overnight runs must survive a multi-hour reset window.
+            # NOTE: HeartbeatWatchdog lives inside _stream_claude; it does NOT run
+            # during this wait, so no pause/reset is needed here.
             if error_info.type == ErrorType.RATE_LIMIT:
+                is_plan = error_info.rate_limit_kind == "plan_usage"
+
+                if is_plan:
+                    if error_info.retry_at is None:
+                        # Shouldn't happen (plan_usage always carries a retry_at),
+                        # but fall back to default so we don't hang.
+                        wait_seconds = ERROR_RETRY_WAIT_SEC
+                    else:
+                        wait_seconds = int(max(0, (error_info.retry_at - datetime.now()).total_seconds()))
+                    wait_seconds = min(wait_seconds, self.config.max_plan_usage_wait_seconds)
+                    reset_str = (
+                        error_info.retry_at.strftime("%H:%M") if error_info.retry_at else "unknown"
+                    )
+                    mins = (wait_seconds + 59) // 60
+                    await self._notify_text(
+                        f"\n[Plan usage limit hit — sleeping until {reset_str} ({mins}m)]\n"
+                    )
+                    wait_start = datetime.now()
+                    slept_fully = await self._sleep_until_resume(
+                        error_info.retry_at or (datetime.now() + timedelta(seconds=wait_seconds)),
+                        wait_seconds,
+                        is_plan=True,
+                    )
+                    if not slept_fully:
+                        break
+                    now_str = datetime.now().strftime("%H:%M")
+                    elapsed = datetime.now() - wait_start
+                    total_min = int(elapsed.total_seconds() // 60)
+                    h, m = divmod(total_min, 60)
+                    await self._notify_text(
+                        f"\n[Resumed at {now_str} after waiting {h}h {m}m]\n"
+                    )
+                    resume_id = error_info.session_id or captured_session_id
+                    options = _fresh_options(resume_session=resume_id)
+                    continue
+
+                # API 429: existing 5-retry cap and wording.
                 rate_limit_retries += 1
                 if rate_limit_retries >= self.config.max_rate_limit_retries:
                     await self._notify_text(
@@ -944,6 +987,29 @@ class Orchestrator:
             options = _fresh_options()
 
         return total_response_text, total_cost, total_duration_ms, total_num_turns, last_error_type
+
+    async def _sleep_until_resume(
+        self, retry_at: datetime, wait_seconds: int, is_plan: bool
+    ) -> bool:
+        """Sleep (with periodic status updates) until ``retry_at`` or ``wait_seconds`` elapses.
+
+        Uses a coarse 10s tick for plan-usage waits to avoid log spam across multi-hour windows.
+        Returns True if the full wait completed; False if interrupted by the stop event.
+        """
+        tick = PLAN_USAGE_TICK_SEC if is_plan else 1
+        remaining = wait_seconds
+        label = "Plan usage limit" if is_plan else "Rate limited"
+        reset_str = retry_at.strftime("%H:%M")
+        while remaining > 0:
+            if self._stop_event.is_set():
+                return False
+            await self._notify_status(
+                f"{label} — resuming at {reset_str} ({remaining}s left)"
+            )
+            step = tick if remaining > tick else remaining
+            await asyncio.sleep(step)
+            remaining -= step
+        return True
 
     async def _stream_claude(
         self, cwd: Path, prompt: str, options: ClaudeAgentOptions

@@ -173,7 +173,8 @@ class RalphConfig:
     hard_timeout_sec: int = 300    # 5 min -> cancel + retry
     autocompact_pct: int = 60     # Auto-compact at this % of context window
     max_error_retries: int = 5     # was hardcoded 3
-    max_rate_limit_retries: int = 10  # was hardcoded 5
+    max_rate_limit_retries: int = 10  # Cap on consecutive API 429 retries (does NOT apply to plan usage limits — those wait for reset)
+    max_plan_usage_wait_seconds: int = 21600  # 6h safety cap on plan-usage-reset wait
     verification_prompt: str = ""   # User-specified what to verify (empty = disabled)
     verification_interval: int = 0  # 0 = disabled, N = every Nth iteration is verification
     max_consecutive_errors: int = 10  # circuit breaker after escalating backoffs
@@ -214,6 +215,8 @@ class RalphConfig:
             errors.append("Verification prompt is required when verification interval is set")
         if self.verification_interval < 0:
             errors.append("Verification interval must be >= 0")
+        if not (60 <= self.max_plan_usage_wait_seconds <= 86400):
+            errors.append("max_plan_usage_wait_seconds must be between 60 and 86400")
         return errors
 
     def save_yaml(self, path: str | Path) -> None:

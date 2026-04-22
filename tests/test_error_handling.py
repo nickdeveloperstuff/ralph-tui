@@ -220,3 +220,24 @@ class TestExceptionPatternMatching:
         assert info is not None
         assert info.type == ErrorType.UNKNOWN
         assert info.retryable is True
+
+
+class TestRateLimitKindPropagation:
+    """ErrorInfo.rate_limit_kind must carry the discriminator from detect_rate_limit."""
+
+    def test_detect_error_propagates_plan_usage_kind(self):
+        text = "You've hit your session limit · resets 3:45pm"
+        messages = [_make_assistant_message(error="rate_limit", text=text)]
+        result = _make_result_message(is_error=True, session_id="sess-plan")
+        info = detect_error(messages, result)
+        assert info is not None
+        assert info.type == ErrorType.RATE_LIMIT
+        assert info.rate_limit_kind == "plan_usage"
+
+    def test_detect_error_api_kind_when_no_plan_phrase(self):
+        messages = [_make_assistant_message(error="rate_limit", text="Try again in 5 minutes")]
+        result = _make_result_message(is_error=True, session_id="sess-api")
+        info = detect_error(messages, result)
+        assert info is not None
+        assert info.type == ErrorType.RATE_LIMIT
+        assert info.rate_limit_kind == "api_rate_limit"
