@@ -382,3 +382,83 @@ class TestErrorRetryCountdown:
             state = await orch.run()
 
         assert "Stopped" in state.status or sleep_count < 30
+
+
+class TestRichLogHorizontalFill:
+    """Task 2: streamed output must fill terminal width, not wrap at column 80."""
+
+    @staticmethod
+    def _make_screen(tmp_path):
+        """Build a RunnerScreen whose orchestrator worker is a no-op."""
+        from unittest.mock import patch
+        from ralph_tui.config import RalphConfig
+        from ralph_tui.screens.runner_screen import RunnerScreen
+
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        (proj / "x.txt").write_text("x")
+        cfg = RalphConfig(
+            project_path=str(proj),
+            initial_prompt="x",
+            rerun_prompt="y",
+            min_iterations=1,
+            max_iterations=1,
+        )
+        screen = RunnerScreen(cfg)
+        # Replace the orchestrator worker with a no-op so the test doesn't
+        # actually copy the project / call the SDK.
+        screen._run_orchestrator = lambda: None
+        return cfg, screen
+
+    @pytest.mark.asyncio
+    async def test_richlog_fills_terminal_width_on_mount(self, tmp_path):
+        """#output-log should be ~terminal_width - margins when mounted."""
+        from ralph_tui.app import RalphApp
+        cfg, screen = self._make_screen(tmp_path)
+        app = RalphApp()
+        async with app.run_test(size=(160, 40)) as pilot:
+            await app.push_screen(screen)
+            await pilot.pause()
+            from textual.widgets import RichLog
+            log = screen.query_one("#output-log", RichLog)
+            assert log.size.width >= 150, f"widget width {log.size.width} too narrow"
+
+    @pytest.mark.asyncio
+    async def test_richlog_width_updates_on_resize(self, tmp_path):
+        """Resizing the terminal must widen the log area."""
+        from ralph_tui.app import RalphApp
+        cfg, screen = self._make_screen(tmp_path)
+        app = RalphApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.push_screen(screen)
+            await pilot.pause()
+            from textual.widgets import RichLog
+            log = screen.query_one("#output-log", RichLog)
+            initial = log.size.width
+            await pilot.resize_terminal(220, 50)
+            await pilot.pause()
+            assert log.size.width > initial, (
+                f"widget did not widen after resize: {initial} -> {log.size.width}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_long_line_wraps_at_terminal_width_not_80(self, tmp_path):
+        """A 300-char line written via the TextChunk handler must wrap beyond col 80."""
+        from ralph_tui.app import RalphApp
+        from ralph_tui.screens.runner_screen import TextChunk
+        cfg, screen = self._make_screen(tmp_path)
+        app = RalphApp()
+        async with app.run_test(size=(160, 40)) as pilot:
+            await app.push_screen(screen)
+            await pilot.pause()
+            screen._on_text(TextChunk("A" * 300))
+            await pilot.pause()
+            await pilot.pause()
+            from textual.widgets import RichLog
+            log = screen.query_one("#output-log", RichLog)
+            assert log.lines, "no lines rendered"
+            first_len = log.lines[0].cell_length
+            assert first_len > 100, (
+                f"first line wrapped at {first_len} cells "
+                f"(expected > 100 — near terminal width)"
+            )

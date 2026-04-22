@@ -224,7 +224,9 @@ class RunnerScreen(Screen):
     @on(TextChunk)
     def _on_text(self, event: TextChunk) -> None:
         log = self.query_one("#output-log", RichLog)
-        log.write(event.text)
+        # expand=True overrides RichLog.min_width (default 78) so writes fill
+        # the widget's inner width instead of wrapping at column ~80.
+        log.write(event.text, expand=True)
 
     @on(ActivityUpdate)
     def _on_activity(self, event: ActivityUpdate) -> None:
@@ -249,7 +251,7 @@ class RunnerScreen(Screen):
             ts = time.strftime("%H:%M:%S")
             tool = event.event.tool_name or "unknown"
             log = self.query_one("#output-log", RichLog)
-            log.write(f"[dim][{ts} Done: {tool}][/dim]")
+            log.write(f"[dim][{ts} Done: {tool}][/dim]", expand=True)
 
     @on(UsageUpdate)
     def _on_usage(self, event: UsageUpdate) -> None:
