@@ -47,6 +47,11 @@ class FakeRunnerScreen:
     def handle_status(self, status: str) -> None:
         self._last_status = status
 
+    def tick_activity(self) -> None:
+        """Mirror of RunnerScreen._tick_activity."""
+        if self._current_tool is not None:
+            self._last_activity_time = time.monotonic()
+
     def build_status_parts(self) -> list[str]:
         """Mirrors RunnerScreen._update_status_bar logic, returns parts list."""
         status = self._last_status
@@ -554,3 +559,57 @@ class TestStickyScroll:
             await pilot.pause()
             assert log.scroll_y >= log.max_scroll_y - 1
             assert log.auto_scroll is True
+
+
+class TestActivityTimerDuringTool:
+    """Task 4: in-flight tool execution must count as activity."""
+
+    def test_activity_age_zero_while_tool_in_flight(self):
+        """After 30s of a running tool, the computed age must be ~0."""
+        screen = FakeRunnerScreen()
+        now = time.monotonic()
+        screen._last_activity_time = now
+        screen._current_tool = "Bash"
+        with patch("time.monotonic", return_value=now + 30):
+            screen.tick_activity()
+            age = int(time.monotonic() - screen._last_activity_time)
+        assert age == 0, f"expected 0s age during tool, got {age}s"
+
+    def test_activity_age_grows_after_tool_end(self):
+        """With no tool in flight, the age should reflect real idle time."""
+        screen = FakeRunnerScreen()
+        now = time.monotonic()
+        screen._last_activity_time = now
+        screen._current_tool = None
+        with patch("time.monotonic", return_value=now + 30):
+            screen.tick_activity()
+            age = int(time.monotonic() - screen._last_activity_time)
+        assert age == 30
+
+    def test_no_stall_warning_during_long_tool(self):
+        """STALL WARNING must not fire while a tool is running, even 120s in."""
+        screen = FakeRunnerScreen()
+        now = time.monotonic()
+        screen._last_activity_time = now
+        screen._current_tool = "Bash"
+        screen._last_status = "Running"
+        # Simulate 120s of elapsed time with the tool still in flight.
+        fake_now = now + 120
+        with patch("time.monotonic", return_value=fake_now):
+            # Every tick keeps activity fresh while the tool runs.
+            screen.tick_activity()
+            parts = screen.build_status_parts()
+        assert not any("STALL WARNING" in p for p in parts), parts
+
+    def test_stall_warning_when_no_tool_and_idle(self):
+        """STALL WARNING must still fire when truly idle (no tool + no stream)."""
+        screen = FakeRunnerScreen()
+        now = time.monotonic()
+        screen._last_activity_time = now
+        screen._current_tool = None
+        screen._last_status = "Running"
+        fake_now = now + 70
+        with patch("time.monotonic", return_value=fake_now):
+            screen.tick_activity()  # no-op since no current_tool
+            parts = screen.build_status_parts()
+        assert any("STALL WARNING" in p for p in parts), parts

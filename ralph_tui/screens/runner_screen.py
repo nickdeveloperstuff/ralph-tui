@@ -180,6 +180,12 @@ class RunnerScreen(Screen):
 
     def _tick_activity(self) -> None:
         """Called every second to update activity indicators in the status bar."""
+        # Tools emit `tool_start` then stay silent until `tool_end`. A long
+        # Bash/Read produces no events mid-call, so without this tick the
+        # "Last activity" age climbs and falsely implies a stall. Treat an
+        # in-flight tool as live activity.
+        if self._current_tool is not None:
+            self._last_activity_time = time.monotonic()
         self._update_status_bar(self._last_status)
 
     def _update_status_bar(self, status: str) -> None:
