@@ -468,6 +468,42 @@ class TestRichLogHorizontalFill:
                 f"(expected > 100 — near terminal width)"
             )
 
+    @pytest.mark.parametrize("term_width", [80, 120, 160, 220, 300])
+    @pytest.mark.asyncio
+    async def test_long_line_fills_widget_at_every_width(self, tmp_path, term_width):
+        """At each terminal width, a long streamed line must fill the log widget's width.
+
+        Parametrizes the sensible range the user might resize to. The check is
+        two-step: the widget itself sits close to the full terminal width (so
+        we know layout didn't gate it to 80 cols), and the rendered first line
+        fills that widget (so we know expand=True is actually on).
+        """
+        from ralph_tui.app import RalphApp
+        from ralph_tui.screens.runner_screen import TextChunk
+        cfg, screen = self._make_screen(tmp_path)
+        app = RalphApp()
+        async with app.run_test(size=(term_width, 40)) as pilot:
+            await app.push_screen(screen)
+            await pilot.pause()
+            # Stream a line guaranteed longer than any width in the grid.
+            screen._on_text(TextChunk("A" * (term_width * 3)))
+            await pilot.pause()
+            await pilot.pause()
+            from textual.widgets import RichLog
+            log = screen.query_one("#output-log", RichLog)
+            assert log.lines, "no lines rendered"
+            # Widget must take most of the terminal (chrome is small).
+            assert log.size.width >= term_width - 10, (
+                f"widget too narrow at term_width={term_width}: "
+                f"log.size.width={log.size.width}"
+            )
+            # Rendered line must fill the widget (border/padding may cost 1 cell).
+            first_len = log.lines[0].cell_length
+            assert first_len >= log.size.width - 2, (
+                f"line did not fill widget at term_width={term_width}: "
+                f"first_len={first_len}, widget_width={log.size.width}"
+            )
+
 
 class TestStickyScroll:
     """Task 3: the output log should pause auto-scroll when the user scrolls up."""
