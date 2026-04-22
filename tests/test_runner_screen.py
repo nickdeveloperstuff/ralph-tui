@@ -686,6 +686,37 @@ class TestStickyScroll:
             assert log.auto_scroll is True
 
     @pytest.mark.asyncio
+    async def test_round_trip_false_true_false(self, tmp_path):
+        """scroll up → End → scroll up again: auto_scroll toggles False→True→False."""
+        from ralph_tui.app import RalphApp
+        from ralph_tui.screens.runner_screen import StickyRichLog
+        screen = self._make_screen(tmp_path)
+        app = RalphApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await app.push_screen(screen)
+            await pilot.pause()
+            log = screen.query_one("#output-log", StickyRichLog)
+            for i in range(200):
+                log.write(f"line {i}", expand=True)
+            await pilot.pause()
+            assert log.max_scroll_y > 10
+
+            # 1) scroll up → False
+            log.scroll_to(y=0, animate=False)
+            await pilot.pause()
+            assert log.auto_scroll is False
+
+            # 2) End → True
+            screen.action_follow_tail()
+            await pilot.pause()
+            assert log.auto_scroll is True
+
+            # 3) scroll up again → False
+            log.scroll_to(y=0, animate=False)
+            await pilot.pause()
+            assert log.auto_scroll is False
+
+    @pytest.mark.asyncio
     async def test_bottom_threshold_boundary_is_exactly_one_line(self, tmp_path):
         """BOTTOM_THRESHOLD=1: scroll_y == max_scroll_y-1 is still 'at tail',
         scroll_y == max_scroll_y-2 flips auto_scroll off."""
