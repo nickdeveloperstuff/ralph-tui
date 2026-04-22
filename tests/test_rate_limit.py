@@ -180,3 +180,60 @@ class TestPlanUsageDetection:
         info = detect_rate_limit(messages, result)
         assert info is not None
         assert info.kind == "api_rate_limit"
+
+    @freeze_time("2026-04-21 09:00:00")
+    def test_plan_usage_12am_midnight(self):
+        """12:00am must parse to hour=0, minute=0 (midnight)."""
+        parsed = _parse_reset_clause("12:00am")
+        # Now is 09:00, so next midnight is tomorrow.
+        assert parsed == datetime(2026, 4, 22, 0, 0, 0)
+
+    @freeze_time("2026-04-21 09:00:00")
+    def test_plan_usage_12pm_noon(self):
+        """12:00pm must parse to hour=12 (noon)."""
+        parsed = _parse_reset_clause("12:00pm")
+        assert parsed == datetime(2026, 4, 21, 12, 0, 0)
+
+    @freeze_time("2026-04-21 09:00:00")
+    def test_plan_usage_11pm_end_of_day(self):
+        parsed = _parse_reset_clause("11:30pm")
+        assert parsed == datetime(2026, 4, 21, 23, 30, 0)
+
+    @freeze_time("2026-04-21 09:00:00")
+    def test_plan_usage_bare_hour_no_minutes(self):
+        """'7am' without minutes defaults to minute=0."""
+        parsed = _parse_reset_clause("7am")
+        assert parsed == datetime(2026, 4, 21, 7, 0, 0) + timedelta(days=1)  # past noon, rolls
+
+    @freeze_time("2026-04-21 14:00:00")
+    @pytest.mark.parametrize("msg", [
+        "You've hit your session limit · resets 3:45pm",
+        "You've hit your session limit • resets 3:45pm",
+        "You've hit your session limit - resets 3:45pm",
+        "You've hit your session limit . resets 3:45pm",
+        "You've hit your session limit resets 3:45pm",
+        "You've hit your weekly limit · resets Mon 12:00am",
+        "You've hit your Opus limit · resets 3:45pm",
+        "You've hit your opus limit · resets 3:45PM",   # casing
+        "Error occurred. You've hit your session limit · resets 3:45pm. Please wait.",
+    ])
+    def test_plan_usage_format_variants(self, msg):
+        """PLAN_USAGE_RE should handle bullet/dash/period/no-separator variants."""
+        messages = [_make_assistant_message(error=None, text=msg)]
+        result = _make_result_message(is_error=False, session_id="s")
+        info = detect_rate_limit(messages, result)
+        assert info is not None, f"failed to detect: {msg!r}"
+        assert info.kind == "plan_usage"
+
+    def test_plan_usage_beats_api_rate_limit_when_both_conditions(self):
+        """If message has BOTH rate_limit error AND plan_usage phrase, kind is plan_usage."""
+        messages = [_make_assistant_message(
+            error="rate_limit",
+            text="You've hit your session limit · resets 11:59pm",
+        )]
+        result = _make_result_message(is_error=True, session_id="sess-dual")
+        info = detect_rate_limit(messages, result)
+        assert info is not None
+        assert info.kind == "plan_usage", (
+            "plan_usage phrase must take precedence over the api_rate_limit error"
+        )
