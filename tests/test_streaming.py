@@ -723,6 +723,79 @@ class TestWatchdogConcurrent:
         assert elapsed < 3, f"Took {elapsed:.1f}s — dead stream was not cancelled"
 
     @pytest.mark.asyncio
+    async def test_content_block_stop_on_text_emits_tool_end_none(self, tmp_path):
+        """ANCHOR — not a fix. orchestrator.py fires tool_end on every
+        content_block_stop, including text-only blocks, with tool_name=None
+        because no tool_use preceded it.
+
+        This documents the current behavior so any future change is deliberate.
+        If this test starts failing, that is progress — but it should be a
+        conscious choice (add a tool_use filter), not an accident.
+        """
+        from pathlib import Path as _Path
+        cfg = _make_config(tmp_path)
+        activity_events: list[ActivityEvent] = []
+
+        async def capture_activity(e):
+            activity_events.append(e)
+
+        orch = Orchestrator(cfg, on_activity=capture_activity)
+
+        async def text_only_stream(prompt, options):
+            from claude_agent_sdk.types import StreamEvent
+            from claude_agent_sdk import ResultMessage
+
+            # Text-only: no tool_use ever.
+            e1 = MagicMock(spec=StreamEvent)
+            e1.session_id = "sess-text"
+            e1.event = {
+                "type": "content_block_start",
+                "content_block": {"type": "text"},
+            }
+            yield e1
+
+            e2 = MagicMock(spec=StreamEvent)
+            e2.session_id = "sess-text"
+            e2.event = {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "hello"},
+            }
+            yield e2
+
+            e3 = MagicMock(spec=StreamEvent)
+            e3.session_id = "sess-text"
+            e3.event = {"type": "content_block_stop"}
+            yield e3
+
+            r = MagicMock(spec=ResultMessage)
+            r.is_error = False
+            r.session_id = "sess-text"
+            r.result = "hello"
+            r.total_cost_usd = 0.0
+            r.duration_ms = 10
+            r.num_turns = 1
+            r.usage = None
+            yield r
+
+        with patch("ralph_tui.orchestrator.query", side_effect=text_only_stream):
+            from claude_agent_sdk import ClaudeAgentOptions
+            await orch._stream_claude(
+                cwd=_Path(cfg.project_path),
+                prompt="hi",
+                options=ClaudeAgentOptions(),
+            )
+
+        tool_end_events = [e for e in activity_events if e.event_type == "tool_end"]
+        assert tool_end_events, (
+            f"expected a spurious tool_end (anchored bug); got events: "
+            f"{[e.event_type for e in activity_events]}"
+        )
+        assert tool_end_events[0].tool_name is None, (
+            f"anchored: tool_end should carry tool_name=None when the block was text; "
+            f"got {tool_end_events[0].tool_name!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_heartbeat_watchdog_cancels_dead_stream_under_3s(self, tmp_path):
         """Under a 2s hard timeout, _stream_claude must return a stall_error within
         ~3s real wall-clock on a truly-dead stream.
