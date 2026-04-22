@@ -528,17 +528,16 @@ class TestE2ETask4ActivityTimerDuringTool:
                 # as a long-running Bash) by patching time.monotonic for the
                 # status-bar calculation, while leaving asyncio alone.
                 base_now = time.monotonic()
-                tool_started_at = screen._last_activity_time
 
                 def fake_monotonic():
                     return base_now + 120
 
-                # With the fake clock, tick the activity timer as the 1s interval
-                # normally would. After the fix, this must refresh activity time,
-                # so age stays ~0 and STALL WARNING does not appear.
+                # Under the corrected Goal 4, the tick does NOT refresh
+                # _last_activity_time. The counter climbs to ~120s (visible
+                # liveness signal); STALL WARNING stays off because the gate
+                # is _current_tool is None.
                 with patch("time.monotonic", side_effect=fake_monotonic):
                     screen._tick_activity()
-                    parts = screen._last_status  # status bar text isn't exposed directly
                     from textual.widgets import Static
                     bar = screen.query_one("#status-bar", Static)
                     rendered = bar.render()
@@ -552,10 +551,18 @@ class TestE2ETask4ActivityTimerDuringTool:
                 assert "STALL WARNING" not in status_text, (
                     f"false stall during tool: {status_text!r}"
                 )
-                # "Last activity" age should not be visible as a large number.
-                # (When age==0, the status bar omits the field entirely.)
-                assert "Last activity: 1" not in status_text  # 1..-prefixed ages
-                assert "Last activity: 2" not in status_text
+                # The counter MUST be visible and large — that's the liveness
+                # signal. A fresh value would mean the old masking regressed.
+                import re as _re
+                m = _re.search(r"Last activity: (\d+)s ago", status_text)
+                assert m is not None, (
+                    f"'Last activity: Ns ago' missing from status: {status_text!r}"
+                )
+                age_shown = int(m.group(1))
+                assert age_shown >= 60, (
+                    f"counter did not climb during tool; got {age_shown}s. "
+                    f"The ticker must reflect real elapsed time, not be masked."
+                )
                 _save_svg(app, "task4_during_tool")
 
                 # Let the tool actually end.

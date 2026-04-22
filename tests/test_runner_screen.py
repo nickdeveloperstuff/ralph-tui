@@ -48,9 +48,13 @@ class FakeRunnerScreen:
         self._last_status = status
 
     def tick_activity(self) -> None:
-        """Mirror of RunnerScreen._tick_activity."""
-        if self._current_tool is not None:
-            self._last_activity_time = time.monotonic()
+        """Mirror of RunnerScreen._tick_activity.
+
+        No-op: the real ticker only refreshes the status bar. _last_activity_time
+        is the user-visible liveness signal and must never be synthetically
+        advanced here — only real Claude events can update it.
+        """
+        pass
 
     def build_status_parts(self) -> list[str]:
         """Mirrors RunnerScreen._update_status_bar logic, returns parts list."""
@@ -76,9 +80,9 @@ class FakeRunnerScreen:
         if not is_error_or_stall and self._last_activity_time > 0:
             stream_age = time.monotonic() - self._last_activity_time
             tool_age = (time.monotonic() - self._last_tool_time) if self._last_tool_time > 0 else 0
-            if stream_age > 60:
+            if stream_age > 60 and self._current_tool is None:
                 parts.append("[bold red]STALL WARNING[/]")
-            elif tool_age > 60 and self._last_tool_time > 0:
+            elif tool_age > 60 and self._last_tool_time > 0 and self._current_tool is None:
                 parts.append(f"[yellow]Writing... {int(tool_age)}s[/]")
 
         return parts
@@ -814,16 +818,24 @@ class TestStickyScroll:
 class TestActivityTimerDuringTool:
     """Task 4: in-flight tool execution must count as activity."""
 
-    def test_activity_age_zero_while_tool_in_flight(self):
-        """After 30s of a running tool, the computed age must be ~0."""
+    def test_activity_age_climbs_during_tool_in_flight(self):
+        """The 'Last activity' counter MUST climb naturally during a long tool.
+
+        The ticker is the user's liveness signal: it reads 0 when Claude just
+        emitted something and climbs otherwise. Masking it to 0 during tools
+        would defeat the purpose. STALL WARNING is gated separately on
+        _current_tool so the climbing counter does NOT cause a false alarm.
+        """
         screen = FakeRunnerScreen()
         now = time.monotonic()
-        screen._last_activity_time = now
+        screen._last_activity_time = now  # simulates tool_start just refreshed it
         screen._current_tool = "Bash"
         with patch("time.monotonic", return_value=now + 30):
-            screen.tick_activity()
+            screen.tick_activity()  # no-op — tick must not touch the timer
             age = int(time.monotonic() - screen._last_activity_time)
-        assert age == 0, f"expected 0s age during tool, got {age}s"
+        assert age == 30, (
+            f"ticker must climb during tool so user sees liveness; got {age}s"
+        )
 
     def test_activity_age_grows_after_tool_end(self):
         """With no tool in flight, the age should reflect real idle time."""
@@ -910,6 +922,80 @@ class TestActivityTimerDuringTool:
             assert "STALL WARNING" in status_text, (
                 f"real RunnerScreen missed STALL WARNING at 70s idle: {status_text!r}"
             )
+
+    @pytest.mark.parametrize("event_type", [
+        "text_delta",
+        "tool_start",
+        "tool_end",
+        "message_start",
+        "message_stop",
+    ])
+    def test_every_claude_event_resets_last_activity_time(self, event_type):
+        """Every non-meta ActivityEvent must reset _last_activity_time.
+
+        This is the 'ticker restarts on anything Claude emits' contract:
+        the user reads liveness off the fact that the number keeps falling
+        back to 0 while the stream is healthy.
+        """
+        screen = FakeRunnerScreen()
+        screen._last_activity_time = 0.0
+        ev = ActivityEvent(
+            timestamp=100.0,
+            event_type=event_type,
+            tool_name=("X" if "tool" in event_type else None),
+        )
+        screen.handle_activity(ev)
+        assert screen._last_activity_time == 100.0, (
+            f"{event_type} did not reset the timer; ticker contract broken"
+        )
+
+    def test_stall_warning_meta_event_does_not_reset_timer(self):
+        """stall_warning is emitted by the watchdog, not Claude — it must
+        NOT reset the timer (otherwise the watchdog would mask real stalls).
+        """
+        screen = FakeRunnerScreen()
+        screen._last_activity_time = 50.0
+        ev = ActivityEvent(timestamp=999.0, event_type="stall_warning")
+        screen.handle_activity(ev)
+        assert screen._last_activity_time == 50.0
+
+    def test_stall_warning_gate_uses_current_tool_not_tick_refresh(self):
+        """Regression guard: prove the STALL WARNING gate is _current_tool,
+        not a synthetic tick refresh.
+
+        Force stream_age = 120s with a tool in flight, and do NOT call
+        tick_activity. STALL WARNING must still be suppressed (via the gate)
+        and 'Last activity: 120s ago' MUST appear (visible liveness signal).
+        """
+        screen = FakeRunnerScreen()
+        now = time.monotonic()
+        screen._last_activity_time = now
+        screen._last_tool_time = now  # tool_start touched this
+        screen._current_tool = "Bash"
+        screen._last_status = "Running"
+        with patch("time.monotonic", return_value=now + 120):
+            # Intentionally NOT calling tick_activity() — the gate alone
+            # must be enough to keep STALL WARNING away.
+            parts = screen.build_status_parts()
+        assert not any("STALL WARNING" in p for p in parts), parts
+        assert any("Last activity: 120s ago" in p for p in parts), (
+            f"counter hidden; user loses the liveness signal. parts={parts}"
+        )
+
+    def test_stall_warning_fires_once_tool_clears_even_with_old_tool_time(self):
+        """Sanity: after tool_end, the gate opens back up and a 70s idle gap
+        produces STALL WARNING. Catches an accidental permanent-suppress
+        if someone gates on `_last_tool_time > 0` instead of `_current_tool`.
+        """
+        screen = FakeRunnerScreen()
+        now = time.monotonic()
+        screen._last_activity_time = now
+        screen._last_tool_time = now  # a tool ran earlier
+        screen._current_tool = None   # but nothing in flight now
+        screen._last_status = "Running"
+        with patch("time.monotonic", return_value=now + 70):
+            parts = screen.build_status_parts()
+        assert any("STALL WARNING" in p for p in parts), parts
 
     def test_back_to_back_tools_track_current_tool(self):
         """Bash finishes, Read starts: _current_tool transitions Bash → None → Read.

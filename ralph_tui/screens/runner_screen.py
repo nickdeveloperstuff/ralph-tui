@@ -179,13 +179,14 @@ class RunnerScreen(Screen):
         self.post_message(UsageUpdate(usage))
 
     def _tick_activity(self) -> None:
-        """Called every second to update activity indicators in the status bar."""
-        # Tools emit `tool_start` then stay silent until `tool_end`. A long
-        # Bash/Read produces no events mid-call, so without this tick the
-        # "Last activity" age climbs and falsely implies a stall. Treat an
-        # in-flight tool as live activity.
-        if self._current_tool is not None:
-            self._last_activity_time = time.monotonic()
+        """Called every second to refresh time-sensitive parts of the status bar.
+
+        Does NOT manipulate _last_activity_time — that field is the liveness
+        signal. It climbs in real time during any gap (tool running, slow
+        stream, true stall) so the user can watch it reset on each Claude
+        emit. STALL WARNING is separately gated on _current_tool so a
+        legitimate in-flight tool never raises it.
+        """
         self._update_status_bar(self._last_status)
 
     def _update_status_bar(self, status: str) -> None:
@@ -231,11 +232,12 @@ class RunnerScreen(Screen):
         if not is_error_or_stall and self._last_activity_time > 0:
             stream_age = time.monotonic() - self._last_activity_time
             tool_age = (time.monotonic() - self._last_tool_time) if self._last_tool_time > 0 else 0
-            if stream_age > 60:
-                # No events at all — true stall
+            if stream_age > 60 and self._current_tool is None:
+                # No Claude events for 60s+ AND no tool in flight — a real stall
                 parts.append("[bold red]STALL WARNING[/]")
-            elif tool_age > 60 and self._last_tool_time > 0:
-                # Text is flowing but no tools for a while
+            elif tool_age > 60 and self._last_tool_time > 0 and self._current_tool is None:
+                # Text flowing but no tools for a while; don't duplicate the
+                # 'Tool: X' line when a tool is currently running.
                 parts.append(f"[yellow]Writing... {int(tool_age)}s[/]")
 
         self.query_one("#status-bar", Static).update("  ".join(parts))
