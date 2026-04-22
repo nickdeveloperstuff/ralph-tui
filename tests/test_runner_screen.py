@@ -863,3 +863,31 @@ class TestActivityTimerDuringTool:
             screen.tick_activity()  # no-op since no current_tool
             parts = screen.build_status_parts()
         assert any("STALL WARNING" in p for p in parts), parts
+
+    def test_back_to_back_tools_track_current_tool(self):
+        """Bash finishes, Read starts: _current_tool transitions Bash → None → Read.
+
+        The intermediate None is expected — tool_end fires before tool_start,
+        so there is a one-event gap where no tool is in flight.
+        """
+        screen = FakeRunnerScreen()
+        t0 = time.monotonic()
+
+        screen.handle_activity(ActivityEvent(
+            timestamp=t0, event_type="tool_start", tool_name="Bash",
+        ))
+        assert screen._current_tool == "Bash"
+
+        screen.handle_activity(ActivityEvent(
+            timestamp=t0 + 1, event_type="tool_end", tool_name="Bash",
+        ))
+        assert screen._current_tool is None, (
+            f"tool_end must clear current_tool; got {screen._current_tool!r}"
+        )
+
+        screen.handle_activity(ActivityEvent(
+            timestamp=t0 + 2, event_type="tool_start", tool_name="Read",
+        ))
+        assert screen._current_tool == "Read", (
+            f"new tool_start must replace cleared slot; got {screen._current_tool!r}"
+        )
