@@ -739,6 +739,40 @@ class TestStickyScroll:
             assert log.auto_scroll is True
 
     @pytest.mark.asyncio
+    async def test_mid_buffer_partial_scroll_preserves_position(self, tmp_path):
+        """Scrolled to halfway: auto_scroll False, and new writes don't change scroll_y."""
+        from ralph_tui.app import RalphApp
+        from ralph_tui.screens.runner_screen import StickyRichLog
+        screen = self._make_screen(tmp_path)
+        app = RalphApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await app.push_screen(screen)
+            await pilot.pause()
+            log = screen.query_one("#output-log", StickyRichLog)
+            for i in range(300):
+                log.write(f"line {i}", expand=True)
+            await pilot.pause()
+            half = log.max_scroll_y // 2
+            assert half >= 5  # sanity: enough buffer for a mid-position
+            log.scroll_to(y=half, animate=False)
+            await pilot.pause()
+            await pilot.pause()
+
+            assert log.auto_scroll is False, (
+                f"mid-buffer must pause auto_scroll; scroll_y={log.scroll_y}, "
+                f"max={log.max_scroll_y}"
+            )
+            saved = log.scroll_y
+
+            for i in range(300, 360):
+                log.write(f"line {i}", expand=True)
+            await pilot.pause()
+            await pilot.pause()
+            assert log.scroll_y == saved, (
+                f"scroll_y drifted while user held mid-buffer: {saved} -> {log.scroll_y}"
+            )
+
+    @pytest.mark.asyncio
     async def test_bottom_threshold_boundary_is_exactly_one_line(self, tmp_path):
         """BOTTOM_THRESHOLD=1: scroll_y == max_scroll_y-1 is still 'at tail',
         scroll_y == max_scroll_y-2 flips auto_scroll off."""
