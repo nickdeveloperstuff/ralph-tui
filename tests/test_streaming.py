@@ -723,6 +723,50 @@ class TestWatchdogConcurrent:
         assert elapsed < 3, f"Took {elapsed:.1f}s — dead stream was not cancelled"
 
     @pytest.mark.asyncio
+    async def test_heartbeat_watchdog_cancels_dead_stream_under_3s(self, tmp_path):
+        """Under a 2s hard timeout, _stream_claude must return a stall_error within
+        ~3s real wall-clock on a truly-dead stream.
+
+        Unlike the existing test_watchdog_cancels_dead_stream, this does NOT patch
+        asyncio.sleep — real sleeps keep the event loop healthy so the cancel
+        propagates to the hung stream task immediately. HeartbeatWatchdog uses
+        time.monotonic() which advances with real time, so SOFT=0.5 / HARD=2.0
+        reliably fires in 2–3s.
+        """
+        from pathlib import Path as _Path
+        cfg = _make_config(tmp_path)
+        orch = Orchestrator(cfg)
+
+        async def mock_dead_query(prompt, options):
+            from claude_agent_sdk.types import StreamEvent
+            se = MagicMock(spec=StreamEvent)
+            se.session_id = "sess-dead2"
+            se.event = {"type": "message_start"}
+            yield se
+            # Stream stalls here forever. asyncio.sleep is NOT patched.
+            await asyncio.sleep(999)
+
+        with patch("ralph_tui.orchestrator.query", side_effect=mock_dead_query), \
+             patch("ralph_tui.orchestrator.SOFT_TIMEOUT_SEC", 0.5), \
+             patch("ralph_tui.orchestrator.HARD_TIMEOUT_SEC", 2.0), \
+             patch("ralph_tui.orchestrator.WATCHDOG_CHECK_INTERVAL_SEC", 0.1), \
+             patch.object(orch, "_cleanup_child_processes", new_callable=AsyncMock):
+            from claude_agent_sdk import ClaudeAgentOptions
+            start = time.monotonic()
+            (_resp, _cost, _dur, _turns, _sid, error_info) = await orch._stream_claude(
+                cwd=_Path(cfg.project_path),
+                prompt="hang",
+                options=ClaudeAgentOptions(),
+            )
+            elapsed = time.monotonic() - start
+
+        assert elapsed < 3.5, f"watchdog did not cancel in time: {elapsed:.2f}s"
+        assert error_info is not None, "dead stream returned no ErrorInfo"
+        assert "stalled" in error_info.raw_message.lower(), (
+            f"expected stall error, got: {error_info.raw_message!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_watchdog_no_false_positives(self, tmp_path):
         """A stream that yields messages regularly should not trigger any stall warnings."""
         cfg = _make_config(tmp_path)
