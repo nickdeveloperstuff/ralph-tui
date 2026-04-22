@@ -468,6 +468,49 @@ class TestRichLogHorizontalFill:
                 f"(expected > 100 — near terminal width)"
             )
 
+    @pytest.mark.asyncio
+    async def test_tool_end_timestamp_line_uses_expand_true(self, tmp_path):
+        """The `[HH:MM:SS Done: X]` line is the second log.write() site in _on_activity.
+
+        expand=True changes the *wrap width* from RichLog's default 78 to the widget
+        inner width. On a typical short 'Done:' line nothing visible changes, so we
+        assert directly on the call kwargs by intercepting log.write.
+        """
+        from ralph_tui.app import RalphApp
+        from ralph_tui.screens.runner_screen import ActivityUpdate
+        from ralph_tui.orchestrator import ActivityEvent
+        cfg, screen = self._make_screen(tmp_path)
+        app = RalphApp()
+        async with app.run_test(size=(160, 40)) as pilot:
+            await app.push_screen(screen)
+            await pilot.pause()
+
+            from textual.widgets import RichLog
+            log = screen.query_one("#output-log", RichLog)
+            captured: list[tuple[tuple, dict]] = []
+            real_write = log.write
+            def spy_write(*args, **kwargs):
+                captured.append((args, kwargs))
+                return real_write(*args, **kwargs)
+            log.write = spy_write  # type: ignore[method-assign]
+
+            screen._on_activity(ActivityUpdate(ActivityEvent(
+                timestamp=0.0,
+                event_type="tool_end",
+                tool_name="Bash",
+            )))
+            await pilot.pause()
+
+            done_calls = [
+                (a, k) for (a, k) in captured
+                if a and isinstance(a[0], str) and "Done: Bash" in a[0]
+            ]
+            assert done_calls, f"tool_end did not write; saw {captured}"
+            _, kwargs = done_calls[0]
+            assert kwargs.get("expand") is True, (
+                f"tool_end 'Done:' line must be written with expand=True; got kwargs={kwargs}"
+            )
+
     @pytest.mark.parametrize("term_width", [80, 120, 160, 220, 300])
     @pytest.mark.asyncio
     async def test_long_line_fills_widget_at_every_width(self, tmp_path, term_width):
