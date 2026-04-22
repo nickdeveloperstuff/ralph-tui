@@ -864,6 +864,53 @@ class TestActivityTimerDuringTool:
             parts = screen.build_status_parts()
         assert any("STALL WARNING" in p for p in parts), parts
 
+    @pytest.mark.asyncio
+    async def test_real_screen_stall_warning_on_true_idle(self, tmp_path):
+        """CONTROL: on the live RunnerScreen, 70s of no-tool idle time must
+        render 'STALL WARNING' in the status bar.
+
+        The FakeRunnerScreen sibling test above exercises the mirror; this
+        one exercises the real _tick_activity + _update_status_bar path so a
+        drift between the two is caught.
+        """
+        from ralph_tui.app import RalphApp
+        from ralph_tui.config import RalphConfig
+        from ralph_tui.screens.runner_screen import RunnerScreen
+
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        (proj / "x.txt").write_text("x")
+        cfg = RalphConfig(
+            project_path=str(proj),
+            initial_prompt="x",
+            rerun_prompt="y",
+            min_iterations=1,
+            max_iterations=1,
+        )
+        screen = RunnerScreen(cfg)
+        screen._run_orchestrator = lambda: None  # no real work
+        app = RalphApp()
+        async with app.run_test(size=(180, 40)) as pilot:
+            await app.push_screen(screen)
+            await pilot.pause()
+            now = time.monotonic()
+            screen._last_activity_time = now
+            screen._current_tool = None
+            screen._last_status = "Running"
+
+            with patch("time.monotonic", return_value=now + 70):
+                screen._tick_activity()
+                from textual.widgets import Static
+                bar = screen.query_one("#status-bar", Static)
+                rendered = bar.render()
+                status_text = (
+                    rendered.plain if hasattr(rendered, "plain") else str(rendered)
+                )
+
+            assert "STALL WARNING" in status_text, (
+                f"real RunnerScreen missed STALL WARNING at 70s idle: {status_text!r}"
+            )
+
     def test_back_to_back_tools_track_current_tool(self):
         """Bash finishes, Read starts: _current_tool transitions Bash → None → Read.
 
