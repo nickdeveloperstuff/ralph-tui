@@ -532,10 +532,11 @@ class TestE2ETask4ActivityTimerDuringTool:
                 def fake_monotonic():
                     return base_now + 120
 
-                # Under the corrected Goal 4, the tick does NOT refresh
-                # _last_activity_time. The counter climbs to ~120s (visible
-                # liveness signal); STALL WARNING stays off because the gate
-                # is _current_tool is None.
+                # Under Goal 4, an in-flight tool is treated as activity: the
+                # tick refreshes _last_activity_time so the user sees
+                # "Last activity: 0s ago" throughout the tool. STALL WARNING
+                # is additionally gated on _current_tool so it cannot fire
+                # during legitimate tool work.
                 with patch("time.monotonic", side_effect=fake_monotonic):
                     screen._tick_activity()
                     from textual.widgets import Static
@@ -551,17 +552,16 @@ class TestE2ETask4ActivityTimerDuringTool:
                 assert "STALL WARNING" not in status_text, (
                     f"false stall during tool: {status_text!r}"
                 )
-                # The counter MUST be visible and large — that's the liveness
-                # signal. A fresh value would mean the old masking regressed.
+                # The counter should read 0-1s because the tick just reset it
+                # (tool IS the activity while it runs).
                 import re as _re
                 m = _re.search(r"Last activity: (\d+)s ago", status_text)
                 assert m is not None, (
                     f"'Last activity: Ns ago' missing from status: {status_text!r}"
                 )
                 age_shown = int(m.group(1))
-                assert age_shown >= 60, (
-                    f"counter did not climb during tool; got {age_shown}s. "
-                    f"The ticker must reflect real elapsed time, not be masked."
+                assert age_shown <= 1, (
+                    f"counter should stay at 0-1s while tool in flight; got {age_shown}s"
                 )
                 _save_svg(app, "task4_during_tool")
 

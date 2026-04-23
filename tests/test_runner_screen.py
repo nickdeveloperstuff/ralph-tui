@@ -20,12 +20,18 @@ class FakeRunnerScreen:
         self._last_status: str = "Initializing"
         self._log_entries: list[str] = []
 
-    def handle_activity(self, event: ActivityEvent) -> None:
-        """Mirrors RunnerScreen._on_activity logic."""
-        # Do NOT reset activity time on stall_warning — that's a meta-event
-        if event.event_type != "stall_warning":
-            self._last_activity_time = event.timestamp
+    def handle_text(self, text: str) -> None:
+        """Mirrors RunnerScreen._on_text logic: text-write resets the timer."""
+        self._log_entries.append(text)
+        self._last_activity_time = time.monotonic()
 
+    def handle_activity(self, event: ActivityEvent) -> None:
+        """Mirrors RunnerScreen._on_activity logic.
+
+        Timer reset is anchored on text-write sites, NOT on every activity
+        event. Here we only reset on tool_end because tool_end writes a
+        'Done:' log line.
+        """
         if event.event_type in ("tool_start", "tool_end"):
             self._last_tool_time = event.timestamp
         if event.event_type == "tool_start":
@@ -38,11 +44,12 @@ class FakeRunnerScreen:
             if any(kw in self._last_status.lower() for kw in ("error", "stall", "retry", "no activity")):
                 self._last_status = "Running"
 
-        # Log tool_end with timestamp
+        # Log tool_end with timestamp, and reset timer since the Done line is user-visible text
         if event.event_type == "tool_end":
             ts = time.strftime("%H:%M:%S")
             tool = event.tool_name or "unknown"
             self._log_entries.append(f"[{ts} Done: {tool}]")
+            self._last_activity_time = time.monotonic()
 
     def handle_status(self, status: str) -> None:
         self._last_status = status
@@ -50,11 +57,14 @@ class FakeRunnerScreen:
     def tick_activity(self) -> None:
         """Mirror of RunnerScreen._tick_activity.
 
-        No-op: the real ticker only refreshes the status bar. _last_activity_time
-        is the user-visible liveness signal and must never be synthetically
-        advanced here — only real Claude events can update it.
+        While a tool is in flight, the tool IS the activity: the user-visible
+        counter is refreshed every tick so "Last activity: 0s ago" stays on
+        screen throughout a long Bash/Read. When no tool is running the
+        ticker does nothing; _last_activity_time climbs so STALL WARNING can
+        fire on a true idle gap.
         """
-        pass
+        if self._current_tool is not None:
+            self._last_activity_time = time.monotonic()
 
     def build_status_parts(self) -> list[str]:
         """Mirrors RunnerScreen._update_status_bar logic, returns parts list."""
@@ -63,11 +73,10 @@ class FakeRunnerScreen:
 
         parts.append(f"Status: {status}")
 
-        # Activity age
+        # Activity age — always render when we have a baseline, including 0s.
         if self._last_activity_time > 0:
             age = int(time.monotonic() - self._last_activity_time)
-            if age > 0:
-                parts.append(f"Last activity: {age}s ago")
+            parts.append(f"Last activity: {age}s ago")
 
         # Current tool
         if self._current_tool:
@@ -88,39 +97,62 @@ class FakeRunnerScreen:
         return parts
 
 
-class TestStallWarningDoesNotResetActivityTime:
-    """1A: stall_warning events should NOT reset _last_activity_time."""
+class TestTextWriteResetsActivityTimer:
+    """User contract: the timer resets every time text appears on screen,
+    regardless of whether the write was driven by a text_delta, by the
+    plan-usage banner, by '[Resumed at ...]', or by the ToolUseBlock
+    fallback. Anchoring on text-writes (not on ActivityEvent types) is what
+    the production code does."""
 
-    def test_stall_warning_does_not_reset_activity_time(self):
+    def test_text_write_resets_timer(self):
         screen = FakeRunnerScreen()
-        # Set activity time to a known past value
         old_time = time.monotonic() - 200
         screen._last_activity_time = old_time
 
-        # Fire a stall_warning event
-        event = ActivityEvent(
-            timestamp=time.monotonic(),
-            event_type="stall_warning",
-        )
+        before = time.monotonic()
+        screen.handle_text("hello world")
+        after = time.monotonic()
+
+        # Timer moved to "now-ish"; definitely advanced past the stale value.
+        assert screen._last_activity_time >= before
+        assert screen._last_activity_time <= after
+
+    def test_stall_warning_does_not_reset_timer(self):
+        """stall_warning is a meta-event emitted by the watchdog, not by
+        Claude, and writes no text; must not reset the timer."""
+        screen = FakeRunnerScreen()
+        old_time = time.monotonic() - 200
+        screen._last_activity_time = old_time
+
+        event = ActivityEvent(timestamp=time.monotonic(), event_type="stall_warning")
         screen.handle_activity(event)
 
-        # Activity time should NOT have changed
         assert screen._last_activity_time == old_time
 
-    def test_real_activity_resets_activity_time(self):
+    def test_silent_activity_events_do_not_reset_timer(self):
+        """message_start / message_delta / message_stop don't render text,
+        so they must NOT reset the timer. This is a direct consequence of
+        the user's contract."""
         screen = FakeRunnerScreen()
-        old_time = time.monotonic() - 200
-        screen._last_activity_time = old_time
+        old_time = time.monotonic() - 100
+        for kind in ("message_start", "message_delta", "message_stop"):
+            screen._last_activity_time = old_time
+            ev = ActivityEvent(timestamp=time.monotonic(), event_type=kind)
+            screen.handle_activity(ev)
+            assert screen._last_activity_time == old_time, (
+                f"{kind} reset the timer; it has no on-screen text"
+            )
 
-        now = time.monotonic()
-        event = ActivityEvent(
-            timestamp=now,
-            event_type="text_delta",
-            text_fragment="hello",
-        )
-        screen.handle_activity(event)
-
-        assert screen._last_activity_time == now
+    def test_tool_end_resets_timer_because_it_writes_done_line(self):
+        """tool_end writes '[HH:MM:SS Done: X]' to the log, which is
+        user-visible text, so it DOES reset the timer."""
+        screen = FakeRunnerScreen()
+        screen._last_activity_time = time.monotonic() - 100
+        before = time.monotonic()
+        screen.handle_activity(ActivityEvent(
+            timestamp=time.monotonic(), event_type="tool_end", tool_name="Bash",
+        ))
+        assert screen._last_activity_time >= before
 
 
 class TestRealActivityClearsStallStatus:
@@ -818,23 +850,23 @@ class TestStickyScroll:
 class TestActivityTimerDuringTool:
     """Task 4: in-flight tool execution must count as activity."""
 
-    def test_activity_age_climbs_during_tool_in_flight(self):
-        """The 'Last activity' counter MUST climb naturally during a long tool.
-
-        The ticker is the user's liveness signal: it reads 0 when Claude just
-        emitted something and climbs otherwise. Masking it to 0 during tools
-        would defeat the purpose. STALL WARNING is gated separately on
-        _current_tool so the climbing counter does NOT cause a false alarm.
+    def test_activity_age_stays_zero_during_tool_in_flight(self):
+        """While a tool is in flight the 'Last activity' counter must stay at
+        0-1s so the user doesn't think a legitimate long Bash/Read has
+        stalled. The tick treats an in-flight tool as activity and refreshes
+        _last_activity_time every second. STALL WARNING is gated on
+        _current_tool (see test_no_stall_warning_during_long_tool) so the
+        two behaviors are consistent.
         """
         screen = FakeRunnerScreen()
         now = time.monotonic()
-        screen._last_activity_time = now  # simulates tool_start just refreshed it
+        screen._last_activity_time = now
         screen._current_tool = "Bash"
         with patch("time.monotonic", return_value=now + 30):
-            screen.tick_activity()  # no-op — tick must not touch the timer
+            screen.tick_activity()  # tool is in flight -> bump
             age = int(time.monotonic() - screen._last_activity_time)
-        assert age == 30, (
-            f"ticker must climb during tool so user sees liveness; got {age}s"
+        assert age == 0, (
+            f"ticker must keep age at 0 while a tool is in flight; got {age}s"
         )
 
     def test_activity_age_grows_after_tool_end(self):
@@ -923,41 +955,56 @@ class TestActivityTimerDuringTool:
                 f"real RunnerScreen missed STALL WARNING at 70s idle: {status_text!r}"
             )
 
-    @pytest.mark.parametrize("event_type", [
-        "text_delta",
-        "tool_start",
-        "tool_end",
-        "message_start",
-        "message_stop",
-    ])
-    def test_every_claude_event_resets_last_activity_time(self, event_type):
-        """Every non-meta ActivityEvent must reset _last_activity_time.
+    def test_every_text_write_resets_timer_real_screen(self):
+        """Production contract on the real widget: _on_text must reset
+        _last_activity_time on every TextChunk, regardless of whether the
+        write came from a text_delta, the plan-usage banner, a '[Resumed
+        at ...]' line, or the AssistantMessage ToolUseBlock fallback.
 
-        This is the 'ticker restarts on anything Claude emits' contract:
-        the user reads liveness off the fact that the number keeps falling
-        back to 0 while the stream is healthy.
+        This is the root-cause fix for the user-reported bug that the
+        counter kept climbing during plan-usage waits.
         """
-        screen = FakeRunnerScreen()
-        screen._last_activity_time = 0.0
-        ev = ActivityEvent(
-            timestamp=100.0,
-            event_type=event_type,
-            tool_name=("X" if "tool" in event_type else None),
-        )
-        screen.handle_activity(ev)
-        assert screen._last_activity_time == 100.0, (
-            f"{event_type} did not reset the timer; ticker contract broken"
-        )
+        import asyncio
 
-    def test_stall_warning_meta_event_does_not_reset_timer(self):
-        """stall_warning is emitted by the watchdog, not Claude — it must
-        NOT reset the timer (otherwise the watchdog would mask real stalls).
-        """
-        screen = FakeRunnerScreen()
-        screen._last_activity_time = 50.0
-        ev = ActivityEvent(timestamp=999.0, event_type="stall_warning")
-        screen.handle_activity(ev)
-        assert screen._last_activity_time == 50.0
+        async def _run():
+            from ralph_tui.app import RalphApp
+            from ralph_tui.config import RalphConfig
+            from ralph_tui.screens.runner_screen import RunnerScreen, TextChunk
+            import tempfile
+            from pathlib import Path
+
+            with tempfile.TemporaryDirectory() as td:
+                proj = Path(td) / "proj"
+                proj.mkdir()
+                (proj / "x.txt").write_text("x")
+                cfg = RalphConfig(
+                    project_path=str(proj),
+                    initial_prompt="x",
+                    rerun_prompt="y",
+                    min_iterations=1,
+                    max_iterations=1,
+                )
+                screen = RunnerScreen(cfg)
+                screen._run_orchestrator = lambda: None
+                app = RalphApp()
+                async with app.run_test(size=(160, 40)) as pilot:
+                    await app.push_screen(screen)
+                    await pilot.pause()
+                    for i, chunk in enumerate([
+                        "streamed text_delta fragment",
+                        "\n[Plan usage limit hit — sleeping until 3:45]\n",
+                        "\n[Resumed at 04:48 after waiting 1h 3m]\n",
+                        "\n[Tool: Read]\n",
+                    ]):
+                        stale = time.monotonic() - 100
+                        screen._last_activity_time = stale
+                        screen._on_text(TextChunk(chunk))
+                        await pilot.pause()
+                        assert screen._last_activity_time > stale, (
+                            f"TextChunk #{i} ({chunk!r}) did not reset the timer"
+                        )
+
+        asyncio.run(_run())
 
     def test_stall_warning_gate_uses_current_tool_not_tick_refresh(self):
         """Regression guard: prove the STALL WARNING gate is _current_tool,

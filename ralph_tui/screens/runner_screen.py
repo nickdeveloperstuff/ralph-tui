@@ -181,12 +181,14 @@ class RunnerScreen(Screen):
     def _tick_activity(self) -> None:
         """Called every second to refresh time-sensitive parts of the status bar.
 
-        Does NOT manipulate _last_activity_time — that field is the liveness
-        signal. It climbs in real time during any gap (tool running, slow
-        stream, true stall) so the user can watch it reset on each Claude
-        emit. STALL WARNING is separately gated on _current_tool so a
-        legitimate in-flight tool never raises it.
+        While a tool is in flight (_current_tool is not None) the tool IS the
+        activity: bump _last_activity_time on every tick so the user sees
+        "Last activity: 0s ago" throughout a long Bash/Read. STALL WARNING is
+        separately gated on _current_tool so it never fires during legitimate
+        tool work, and once the tool ends the timer resumes climbing from 0.
         """
+        if self._current_tool is not None:
+            self._last_activity_time = time.monotonic()
         self._update_status_bar(self._last_status)
 
     def _update_status_bar(self, status: str) -> None:
@@ -205,11 +207,12 @@ class RunnerScreen(Screen):
             f"Elapsed: {minutes}m {seconds:02d}s",
         ]
 
-        # Activity age
+        # Activity age — ALWAYS render when we have a baseline, including 0s.
+        # The user's glanceable-liveness contract is watching it snap to 0 as
+        # each chunk lands; the old "hide when 0" guard erased that signal.
         if self._last_activity_time > 0:
             age = int(time.monotonic() - self._last_activity_time)
-            if age > 0:
-                parts.append(f"Last activity: {age}s ago")
+            parts.append(f"Last activity: {age}s ago")
 
         # Current tool
         if self._current_tool:
@@ -253,12 +256,21 @@ class RunnerScreen(Screen):
         # expand=True overrides RichLog.min_width (default 78) so writes fill
         # the widget's inner width instead of wrapping at column ~80.
         log.write(event.text, expand=True)
+        # User contract: "every time new text appears on screen, the timer
+        # resets to 0." The _on_activity path misses this for text written
+        # directly via _notify_text (plan-usage banner, "[Resumed at ...]",
+        # error-retry line, ToolUseBlock fallback) — so anchor the reset
+        # on the write itself.
+        self._last_activity_time = time.monotonic()
 
     @on(ActivityUpdate)
     def _on_activity(self, event: ActivityUpdate) -> None:
-        # Do NOT reset activity time on stall_warning — that's a meta-event, not real activity
-        if event.event.event_type != "stall_warning":
-            self._last_activity_time = event.event.timestamp
+        # _last_activity_time is now anchored on text-write sites (_on_text,
+        # tool_end's "Done:" line, _on_run_complete) per user spec: "every
+        # time new text appears on screen, the timer resets to 0." We do NOT
+        # reset here on message_start/message_delta/message_stop because
+        # those events carry no on-screen text; resetting on them would lie
+        # to the user about liveness during silent gaps.
 
         if event.event.event_type in ("tool_start", "tool_end"):
             self._last_tool_time = event.event.timestamp
@@ -278,6 +290,9 @@ class RunnerScreen(Screen):
             tool = event.event.tool_name or "unknown"
             log = self.query_one("#output-log", RichLog)
             log.write(f"[dim][{ts} Done: {tool}][/dim]", expand=True)
+            # The Done line is user-visible text, so it resets the timer
+            # same as any other text write.
+            self._last_activity_time = time.monotonic()
 
     @on(UsageUpdate)
     def _on_usage(self, event: UsageUpdate) -> None:
@@ -299,10 +314,11 @@ class RunnerScreen(Screen):
     @on(RunComplete)
     def _on_run_complete(self, event: RunComplete) -> None:
         log = self.query_one("#output-log", RichLog)
-        log.write(f"\n{'='*60}")
-        log.write(f"Run complete. Total cost: ${event.state.total_cost_usd:.4f}")
-        log.write(f"Status: {event.state.status}")
-        log.write(f"Iterations completed: {len(event.state.results)}")
+        log.write(f"\n{'='*60}", expand=True)
+        log.write(f"Run complete. Total cost: ${event.state.total_cost_usd:.4f}", expand=True)
+        log.write(f"Status: {event.state.status}", expand=True)
+        log.write(f"Iterations completed: {len(event.state.results)}", expand=True)
+        self._last_activity_time = time.monotonic()
         self.query_one("#btn-stop", Button).label = "Back"
 
     @on(Button.Pressed, "#btn-stop")
